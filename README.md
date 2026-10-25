@@ -35,6 +35,44 @@ The application is designed for research workflows where you want local model in
 
 ## Core capabilities
 
+<p align="center">
+  <img src="/images/Search1.png" width="800" alt="Searching content for reasoning using Exa, specifying a search and an objective.">
+  <br>
+  <em>Searching content for reasoning using Exa, specifying a search and an objective.</em>
+</p>
+
+<br>
+
+<p align="center">
+  <img src="/images/Search2.png" width="800" alt="De-select the search results to exclude from reasoning">
+  <br>
+  <em>De-select the search results to exclude from reasoning</em>
+</p>
+
+<br>
+
+<p align="center">
+  <img src="/images/Search3.png" width="800" alt="Receive suggested additional searches based upon the previous search results, taking into account the original search objective.">
+  <br>
+  <em>Receive suggested additional searches based upon the previous search results, taking into account the original search objective.</em>
+</p>
+
+<br>
+
+<p align="center">
+  <img src="/images/Search4.png" width="800" alt="Example of the reasoning output, model choice, live chat, and text to speech">
+  <br>
+  <em>Example of the reasoning output, model choice, live chat, and text to speech</em>
+</p>
+
+<br>
+
+<p align="center">
+  <img src="/images/Search5.png" width="800" alt="Citations of the selected articles used for reasoning, and the reasoning time.">
+  <br>
+  <em>Citations of the selected articles used for reasoning, and the reasoning time.</em>
+</p>
+
 ### Local model inference
 
 Choose a model for each prompt:
