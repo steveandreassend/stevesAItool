@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Exa Research Assistant for macOS.
+"""Steve's AI for macOS.
 
 Features:
 - Local Qwen/MLX-LM chat and final synthesis
@@ -2148,7 +2148,7 @@ HTML = r'''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Local Exa Research Assistant</title>
+<title>Steve's AI Tool</title>
 <style>
 :root{color-scheme:light;--blue:#0a66c2;--line:#d7d7dc;--muted:#6b6b73}
 :root[data-theme="dark"]{color-scheme:dark;--line:#45464d;--muted:#aaaab3}

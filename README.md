@@ -1,10 +1,47 @@
 # Steve's AI Tool
 
-A local-first research and analysis application for Apple Silicon Macs. It combines local MLX language models, Exa web search, document analysis, YouTube summarisation, live voice input, multilingual read-aloud, and a browser-based interface in a single Python application.
+A local-first research and analysis application for Apple Silicon Macs. It combines local MLX language models, Exa web search, document analysis, YouTube summarization, live voice input, multilingual read-aloud, and a browser-based interface in a single Python application.
 
 The application is designed for research workflows where you want local model inference and direct control over the evidence supplied to the model, while retaining the option to retrieve current web content through Exa.
 
-> **Platform:** macOS on Apple Silicon is strongly recommended. The MLX backends used by this project are designed for Apple Silicon and are not intended as a general cross-platform inference layer.
+## Features
+
+**Hardware:**
+- **Private** - It runs entirely on a MacBook Pro and no AI reasoning information leaves it. And it’s free, without user limits.
+- **Apple optimized** - Exploits the Apple silicon hardware capabilities to improve performance (MLX).
+- **Monitoring** - Monitors the memory consumption of your laptop in case you overload it.
+
+**Search:**
+- **Controlled search** - Personalized search, with user controls over which content to reason upon to control accuracy, bias, and the location where you’re searching from.
+- **Suggested searches** - Generates suggested additional searches to retrieve more related content, based upon what your stated objective is.
+- **Combine searches** - Allows you to run multiple searches and combine the results.
+- **Control sources** - Allows you to include and exclude specific content and websites. Allows you to remove specific search results from the reasoning phase.
+- **Quantity of sources** - Control how many articles you want to retrieve. Commercial services might retrieve 2-3, but what if you want 80 to capture a broader view on a topic?
+- **Previews** - Toggle whether you want to see a preview of the sources.
+
+**Languages:**
+- **Multilingual** - Reads, writes, speaks, and listens in multiple languages in a native dialect and accent.
+- **Voice control** - Live AI chat mode, with a mic mute button.
+
+**Reasoning:**
+- **Bulk document analysis** - Upload up to 15 documents at a time. Copilot limits you to 3.
+- **Model selection** - Choice of models from Google, Qwen, Deepseek depending on the chosen task - whether it be fast summarization or slow deep reasoning.
+- **Switch models** - Switch between models during the chat.
+- **Ease of use** - Automatically downloads a model from Hugging Face the first time you select it.
+- **Large context windows** - Up to an 8X larger context window (262K) than some of the major commercial services (16K).
+- **Youtube transcription** - Transcribes the audio of any Youtube video in any language, even if there are no subtitles, for analysis and reasoning. No more sitting through long seminars or lectures.
+- **Reasoning** - Shows the reasoning so you can understand how conclusions were reached.
+- **Notifications** - Notifications - it rings a bell when it’s done. You can mute that too.
+
+**Downsides:**
+- **Speed** - Responses take considerably longer than using a powerful GPU cluster in the cloud. Usually you'll have time to get a coffee for each response.
+- **Investment** - You’ll need a MacBook that costs in excess of 3000 EUR as a starting point, with at least 24GB RAM as an absolute minimum. Budget 5000 EUR for a good one. Shop around - some Windows laptops with Nvidia or AMD chips can offer much better performance than a Mac and may cost you less.
+
+<p align="center">
+  <img src="/images/UI.png" width="800" alt=Overview of the user interface.">
+  <br>
+  <em>Overview of the user interface.</em>
+</p>
 
 ## Table of contents
 
@@ -12,7 +49,7 @@ The application is designed for research workflows where you want local model in
   - [Local model inference](#local-model-inference)
   - [Exa web research](#exa-web-research)
   - [Local document analysis](#local-document-analysis)
-  - [YouTube summarisation](#youtube-summarisation)
+  - [YouTube summarization](#youtube-summarization)
   - [Live voice mode](#live-voice-mode)
   - [Multilingual read-aloud](#multilingual-read-aloud)
   - [Research-oriented browser interface](#research-oriented-browser-interface)
@@ -33,7 +70,7 @@ The application is designed for research workflows where you want local model in
 - [Acknowledgements](#acknowledgements)
 
 
-## Core capabilities
+## Usage Screenshots
 
 <p align="center">
   <img src="/images/Search1.png" width="800" alt="Searching content for reasoning using Exa, specifying a search and an objective.">
@@ -73,15 +110,17 @@ The application is designed for research workflows where you want local model in
   <em>Citations of the selected articles used for reasoning, and the reasoning time.</em>
 </p>
 
+## Core capabilities
+
 ### Local model inference
 
 Choose a model for each prompt:
 
-- **Qwen3 14B 4-bit** for general research, analysis, and synthesis.
-- **DeepSeek-R1 Distill Qwen 14B 4-bit** for more deliberate reasoning tasks.
-- **Qwen3.5 9B 4-bit** for long-context summarisation.
-- **Qwen3.5 4B 4-bit** for faster summarisation with lower memory use.
-- **Gemma 4 12B 4-bit** for multimodal-capable analysis and reasoning through MLX-VLM.
+- **Qwen3 14B 4-bit (DEFAULT)** — general-purpose research, analysis, synthesis, writing, and multilingual tasks. Supports **32,768 tokens natively**, extendable to **131,072 tokens with YaRN**, with switchable thinking and non-thinking modes.
+- **DeepSeek-R1 Distill Qwen 14B 4-bit** — deliberate reasoning, complex problem-solving, mathematics, coding, and tasks that benefit from self-verification. Supports a context window of approximately **128K tokens**, but is generally slower and more verbose than Qwen3.
+- **Qwen3.5 9B 4-bit** — long-document summarization, research synthesis, visual-document analysis, and reasoning where a balance of quality, speed, and memory use is required. Supports **262,144 tokens natively**, extendable to approximately **1 million tokens**, with text and image input.
+- **Qwen3.5 4B 4-bit** — fast, memory-efficient summarization, extraction, classification, and routine document processing. Supports **262,144 tokens natively**, extendable to approximately **1 million tokens**, with text and image input, although practical context may be constrained by available unified memory.
+- **Gemma 4 12B 4-bit** — multimodal analysis and reasoning across text, images, audio, and video through **MLX-VLM**. Supports a context window of up to **256K tokens** and configurable thinking modes, making it the preferred option when the input is not limited to text.
 
 Only one large model is retained in memory at a time. When you switch models, the application releases the previous model and clears the MLX cache before loading the next one.
 
@@ -148,7 +187,7 @@ Text is extracted locally and added to the active research session. PDF, Word, a
 
 > The default extraction limit is 120,000 characters per file. Scanned PDFs require OCR before upload because the application extracts embedded PDF text but does not perform OCR.
 
-### YouTube summarisation
+### YouTube summarization
 
 Paste a supported single-video YouTube URL into the prompt field. The application:
 
@@ -410,7 +449,7 @@ The application supports the following environment variables:
 | `MAX_WEB_RESULTS` | `8` | Default maximum Exa results. The UI requests results in multiples of eight. |
 | `EXA_QUERY_HISTORY_TURNS` | `6` | Recent turns available to contextual search-query planning. |
 | `EXA_QUERY_MAX_TOKENS` | `180` | Token limit for generated search queries. |
-| `MAX_TRANSCRIPT_CHARS` | `500000` | Maximum transcript characters supplied for YouTube summarisation. |
+| `MAX_TRANSCRIPT_CHARS` | `500000` | Maximum transcript characters supplied for YouTube summarization. |
 | `LIVE_MIN_THRESHOLD` | `0.006` | Minimum live-mode audio threshold. |
 | `LIVE_SILENCE_SECONDS` | `1.75` | Silence duration used to end an utterance. |
 | `LIVE_MAX_UTTERANCE_SECONDS` | `30` | Maximum duration of one live utterance. |
@@ -444,8 +483,8 @@ python app.py
 |---|---|---|---|
 | `default` | `mlx-community/Qwen3-14B-4bit` | MLX-LM | General research and synthesis |
 | `reasoning` | `mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit` | MLX-LM | Deliberate reasoning |
-| `summary` | `mlx-community/Qwen3.5-9B-MLX-4bit` | MLX-VLM | Long-context summarisation |
-| `quick` | `mlx-community/Qwen3.5-4B-MLX-4bit` | MLX-VLM | Faster, lower-memory summarisation |
+| `summary` | `mlx-community/Qwen3.5-9B-MLX-4bit` | MLX-VLM | Long-context summarization |
+| `quick` | `mlx-community/Qwen3.5-4B-MLX-4bit` | MLX-VLM | Faster, lower-memory summarization |
 | `gemma` | `mlx-community/gemma-4-12B-it-4bit` | MLX-VLM | Multimodal-capable analysis and reasoning |
 
 Model identifiers, repositories, and compatibility can change. If a configured model is unavailable, update the corresponding entry in `MODEL_OPTIONS` in `app.py` to a compatible MLX repository.
@@ -466,11 +505,11 @@ All selected results from all accumulated search batches are available to the mo
 
 ### B. Build a multi-search evidence set
 
-Run several related searches. Each new batch is appended to the existing session, while duplicate URLs are skipped. After each batch, use **Suggest follow up searches** to identify complementary research angles. Select the articles that should form the final evidence set, then ask the model to compare or synthesise them.
+Run several related searches. Each new batch is appended to the existing session, while duplicate URLs are skipped. After each batch, use **Suggest follow up searches** to identify complementary research angles. Select the articles that should form the final evidence set, then ask the model to compare or synthesize them.
 
 ### C. Analyse local documents
 
-Select **Attach up to 15 documents**, choose the files, and wait for extraction to complete. Then ask the model to summarise, compare, challenge, or combine the uploaded material. Files remain attached until the session is reset.
+Select **Attach up to 15 documents**, choose the files, and wait for extraction to complete. Then ask the model to summarize, compare, challenge, or combine the uploaded material. Files remain attached until the session is reset.
 
 ### D. Summarise a YouTube video
 
@@ -499,14 +538,14 @@ The local-first design reduces unnecessary disclosure, but it should not be trea
 - Reset removes the active session's uploaded-file directory and generated audio.
 - The server has no authentication and binds to localhost by default.
 
-For confidential or regulated use, review the code, dependency supply chain, data-retention behaviour, Exa terms, and network traffic before deployment.
+For confidential or regulated use, review the code, dependency supply chain, data-retention behavior, Exa terms, and network traffic before deployment.
 
 ## Important limitations
 
 - This is a local development application, not a hardened multi-user service.
 - In-memory sessions are lost when the process stops.
-- There is no user authentication or authorisation.
-- Uploaded filenames are sanitised, but uploaded content should still be treated as untrusted input.
+- There is no user authentication or authorization.
+- Uploaded filenames are sanitized, but uploaded content should still be treated as untrusted input.
 - Prompt injection can exist inside web pages and uploaded documents. Review selected evidence and do not assume model output is authoritative.
 - Extracted PDF text quality depends on the source PDF.
 - Excel extraction reads cell values but does not reproduce workbook formatting or formulas as a visual spreadsheet.
@@ -606,7 +645,7 @@ Then open `http://127.0.0.1:8081`.
 
 Do not expose the built-in Flask server directly to a network. If remote access is required:
 
-- Add authentication and authorisation.
+- Add authentication and authorization.
 - Add CSRF protection and request-rate controls.
 - Restrict upload types and sizes further.
 - Isolate temporary files per authenticated user.
