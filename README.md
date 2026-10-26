@@ -13,7 +13,7 @@ The application is designed for research workflows where you want local model in
 ## Features
 
 **Hardware:**
-- **Private** - It runs entirely on a MacBook Pro and no AI reasoning information leaves it. And it’s free, without user limits.
+- **Private** - It runs entirely on a MacBook Pro and no AI prompts or reasoning information leaves it. And it’s free, without user limits.
 - **Apple optimized** - Exploits the Apple silicon hardware capabilities to improve performance (MLX).
 - **Monitoring** - Monitors the memory consumption of your laptop in case you overload it.
 
