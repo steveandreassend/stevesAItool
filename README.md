@@ -4,10 +4,16 @@ A local-first research and analysis application for Apple Silicon Macs. It combi
 
 The application is designed for research workflows where you want local model inference and direct control over the evidence supplied to the model, while retaining the option to retrieve current web content through Exa.
 
+<p align="center">
+  <img src="/images/UI.png" width="800" alt=Overview of the user interface.">
+  <br>
+  <em>Overview of the user interface.</em>
+</p>
+
 ## Features
 
 **Hardware:**
-- **Private** - It runs entirely on a MacBook Pro and no AI reasoning information leaves it. And it’s free, without user limits.
+- **Private** - It runs entirely on a MacBook Pro and no AI prompts or reasoning information leaves it. And it’s free, without user limits.
 - **Apple optimized** - Exploits the Apple silicon hardware capabilities to improve performance (MLX).
 - **Monitoring** - Monitors the memory consumption of your laptop in case you overload it.
 
@@ -36,12 +42,6 @@ The application is designed for research workflows where you want local model in
 **Downsides:**
 - **Speed** - Responses take considerably longer than using a powerful GPU cluster in the cloud. Usually you'll have time to get a coffee for each response.
 - **Investment** - You’ll need a MacBook that costs in excess of 3000 EUR as a starting point, with at least 24GB RAM as an absolute minimum. Budget 5000 EUR for a good one. Shop around - some Windows laptops with Nvidia or AMD chips can offer much better performance than a Mac and may cost you less.
-
-<p align="center">
-  <img src="/images/UI.png" width="800" alt=Overview of the user interface.">
-  <br>
-  <em>Overview of the user interface.</em>
-</p>
 
 ## Table of contents
 
@@ -234,7 +234,7 @@ Responses can be read aloud in:
 - Dutch
 - Portuguese
 
-English uses StyleTTS2. Non-English playback uses offline Argos Translate for English-to-target translation and a language-specific Piper voice. Piper voice models can be downloaded automatically on first use.
+English uses Piper with NeMo Text Processing for text normalization. Non-English playback uses offline Argos Translate for English-to-target translation and a language-specific Piper voice. Piper voice models can be downloaded automatically on first use.
 
 **Why this is useful:**
 
@@ -265,7 +265,7 @@ The project is intentionally contained in a single `app.py` file:
 - **MLX-LM and MLX-VLM** run local language models.
 - **Exa** supplies optional web retrieval.
 - **MLX Whisper** handles voice and fallback YouTube transcription.
-- **StyleTTS2, Piper, and Argos Translate** provide local speech and translation functions.
+- **Piper, NeMo Text Processing, and Argos Translate** provide local speech, text-normalization, and translation functions.
 - **Python document libraries** extract text from common file formats.
 
 This single-file structure makes the application easy to inspect and deploy locally, although production deployments may benefit from separating the server, templates, static assets, configuration, and dependency definitions.
@@ -295,19 +295,27 @@ Actual memory use and performance depend on the selected model, prompt length, r
 
 ### 1. Install system dependencies
 
-Install Homebrew if it is not already available, then install the required command-line dependencies:
+Install Homebrew and Miniconda if they are not already available, then install the required command-line dependencies:
 
 ```bash
 brew update
-brew install python@3.11 git ffmpeg portaudio
+brew install git ffmpeg portaudio
+brew install --cask miniconda
 ```
 
 `ffmpeg` is required for YouTube audio conversion. `portaudio` is required by the live microphone feature through `sounddevice`.
 
+Initialize Conda for `zsh` if required, then restart Terminal or reload the shell configuration:
+
+```bash
+conda init zsh
+source ~/.zshrc
+```
+
 Confirm the tools are available:
 
 ```bash
-python3.11 --version
+conda --version
 git --version
 ffmpeg -version
 ```
@@ -321,11 +329,13 @@ git clone https://github.com/YOUR-USERNAME/YOUR-REPOSITORY.git
 cd YOUR-REPOSITORY
 ```
 
-### 3. Create and activate a virtual environment
+### 3. Create and activate the Conda environment
+
+Create a dedicated environment and activate it:
 
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
+conda create -n local-assistant python=3.13.5 -y
+conda activate local-assistant
 ```
 
 Upgrade the packaging tools:
@@ -337,12 +347,18 @@ python -m pip install --upgrade pip setuptools wheel
 Whenever you open a new Terminal window, return to the repository and reactivate the environment:
 
 ```bash
-source .venv/bin/activate
+conda activate local-assistant
 ```
 
 ### 4. Install Python dependencies
 
-Install the main application, model, search-support, document, voice, and YouTube dependencies:
+Install Pynini through Conda. The tested version is `2.1.6.post1`:
+
+```bash
+conda install -c conda-forge "pynini=2.1.6.post1" -y
+```
+
+Install the main application, model, document, voice, translation, and YouTube dependencies:
 
 ```bash
 python -m pip install \
@@ -352,25 +368,69 @@ python -m pip install \
   mlx-lm \
   mlx-vlm \
   mlx-whisper \
-  numpy \
-  sounddevice \
-  psutil \
+  piper-tts \
+  yt-dlp \
+  youtube-transcript-api \
+  argostranslate \
   pypdf \
   python-docx \
   openpyxl \
-  youtube-transcript-api \
-  yt-dlp \
-  argostranslate \
-  piper-tts \
-  torch \
-  nltk \
+  sounddevice \
   pydub \
-  styletts2
+  psutil \
+  numpy \
+  nltk
 ```
 
-If you only want typed prompts, local document analysis, Exa search, and local model responses, the speech packages can be treated as optional. The application detects an unavailable StyleTTS2 installation at startup and continues running, but English read-aloud will not work until its dependencies are installed.
+Install NeMo Text Processing without dependency resolution, then install the additional libraries it requires:
 
-> Some speech packages have stricter Python or dependency compatibility than the core MLX stack. If `styletts2` does not install cleanly in your environment, install and test the core application first, then add StyleTTS2 separately. Non-English Piper speech is independent of StyleTTS2.
+```bash
+python -m pip install "nemo_text_processing==1.2.0" --no-deps
+
+python -m pip install \
+  inflect \
+  editdistance \
+  sacremoses \
+  pandas \
+  regex \
+  cdifflib \
+  transformers \
+  wget \
+  wrapt
+```
+
+Check the environment for unresolved or incompatible dependencies:
+
+```bash
+python -m pip check
+```
+
+Verify Pynini and NeMo Text Processing, including the English normalization used before speech synthesis:
+
+```bash
+python - <<'PY'
+import pynini
+import cdifflib
+import transformers
+import wget
+import wrapt
+
+from nemo_text_processing.text_normalization.normalize import Normalizer
+
+print("Pynini:", pynini.__version__)
+normalizer = Normalizer(input_case="cased", lang="en")
+
+for text in ["AI", "WW II", "AI played an important role in WW II."]:
+    print(text, "->", normalizer.normalize(text, verbose=False))
+PY
+```
+
+If Pynini was previously installed at another version, replace it with the tested build:
+
+```bash
+conda remove pynini -y
+conda install -c conda-forge "pynini=2.1.6.post1" -y
+```
 
 ### 5. Configure the Exa API key
 
@@ -604,15 +664,16 @@ python -m pip install --upgrade sounddevice
 
 Then check **System Settings > Privacy & Security > Microphone** and allow access for the terminal application.
 
-### StyleTTS2 is unavailable
+### NeMo Text Processing is unavailable
 
-The application can still run without English read-aloud. To retry installation:
+Confirm that Pynini is installed through Conda, then reinstall NeMo Text Processing and its required libraries:
 
 ```bash
-python -m pip install --upgrade torch nltk pydub styletts2
+conda install -c conda-forge "pynini=2.1.6.post1" -y
+python -m pip install "nemo_text_processing==1.2.0" --no-deps
+python -m pip install inflect editdistance sacremoses pandas regex cdifflib transformers wget wrapt
+python -m pip check
 ```
-
-Check that FFmpeg is installed and review the startup diagnostic printed by the application.
 
 ### Piper voice download fails
 
