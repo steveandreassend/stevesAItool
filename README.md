@@ -4,16 +4,10 @@ A local-first research and analysis application for Apple Silicon Macs. It combi
 
 The application is designed for research workflows where you want local model inference and direct control over the evidence supplied to the model, while retaining the option to retrieve current web content through Exa.
 
-<p align="center">
-  <img src="/images/UI.png" width="800" alt=Overview of the user interface.">
-  <br>
-  <em>Overview of the user interface.</em>
-</p>
-
 ## Features
 
 **Hardware:**
-- **Private** - It runs entirely on a MacBook Pro and no AI prompts or reasoning information leaves it. And it’s free, without user limits.
+- **Private** - It runs entirely on a MacBook Pro and no AI reasoning information leaves it. And it’s free, without user limits.
 - **Apple optimized** - Exploits the Apple silicon hardware capabilities to improve performance (MLX).
 - **Monitoring** - Monitors the memory consumption of your laptop in case you overload it.
 
@@ -42,6 +36,12 @@ The application is designed for research workflows where you want local model in
 **Downsides:**
 - **Speed** - Responses take considerably longer than using a powerful GPU cluster in the cloud. Usually you'll have time to get a coffee for each response.
 - **Investment** - You’ll need a MacBook that costs in excess of 3000 EUR as a starting point, with at least 24GB RAM as an absolute minimum. Budget 5000 EUR for a good one. Shop around - some Windows laptops with Nvidia or AMD chips can offer much better performance than a Mac and may cost you less.
+
+<p align="center">
+  <img src="/images/UI.png" width="800" alt=Overview of the user interface.">
+  <br>
+  <em>Overview of the user interface.</em>
+</p>
 
 ## Table of contents
 
@@ -661,4 +661,4 @@ Published under the MIT license.
 
 ## Acknowledgements
 
-This project brings together the Flask, MLX, MLX-LM, MLX-VLM, MLX Whisper, Exa, YouTube Transcript API, yt-dlp, StyleTTS2, Piper, Argos Translate, and related Python ecosystems.
+This project integrates Flask, MLX, MLX-LM, MLX-VLM, MLX Whisper, Exa, the YouTube Transcript API, yt-dlp, Piper, NeMo Text Processing, Argos Translate, and supporting Python libraries.

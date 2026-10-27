@@ -9,7 +9,7 @@ Features:
 - Live microphone prompts with adaptive voice activity detection
 - Manual microphone mute and automatic mute before Read Aloud
 - Per-response language selection and local translation
-- StyleTTS2 English speech and language-specific Piper non-English speech
+- Piper speech for English and all supported non-English languages
 - Detailed STDOUT dialog and diagnostics
 """
 from __future__ import annotations
@@ -142,9 +142,10 @@ SEARCH_LANGUAGES = {
     "tr": "Turkish", "uk": "Ukrainian", "ur": "Urdu", "vi": "Vietnamese",
 }
 DEFAULT_SEARCH_LANGUAGES = ["en"]
-# English keeps the StyleTTS2 voice from the reference implementation.
-# Every non-English language uses its own Piper voice model and phoneme config.
+# Every supported Read Aloud language uses Piper, including English.
+# This gives English the same stable synthesis path that already works for French.
 PIPER_VOICE_NAMES = {
+    "en": os.getenv("PIPER_VOICE_EN", "en_US-libritts_r-medium"),
     "fr": os.getenv("PIPER_VOICE_FR", "fr_FR-siwis-medium"),
     "de": os.getenv("PIPER_VOICE_DE", "de_DE-thorsten-medium"),
     "es": os.getenv("PIPER_VOICE_ES", "es_ES-sharvard-medium"),
@@ -160,10 +161,17 @@ ARGOS_AUTO_DOWNLOAD = os.getenv("ARGOS_AUTO_DOWNLOAD", "1").lower() not in {"0",
 _argos_lock = threading.Lock()
 _piper_voices: dict[str, Any] = {}
 _piper_lock = threading.Lock()
+_nemo_normalizer = None
+_nemo_lock = threading.Lock()
 YOUTUBE_URL_RE = re.compile(
     r"^https?://(?:www\.|m\.)?"
     r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/)|youtu\.be/)"
     r"[A-Za-z0-9_-]{11}(?:[?&/#].*)?$",
+    re.I,
+)
+YOUTUBE_URL_EXTRACT_RE = re.compile(
+    r"https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?(?:[^\s#]*&)?v=|shorts/|live/|embed/)|youtu\.be/)"
+    r"[A-Za-z0-9_-]{11}(?:[^\s<>'\"]*)?",
     re.I,
 )
 
@@ -1181,18 +1189,53 @@ def youtube_video_id(url: str) -> str | None:
     return candidate if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate or "") else None
 
 
-def transcript_text(items: Any) -> str:
+def extract_youtube_urls(text: str) -> list[str]:
+    """Return unique YouTube video URLs in prompt order."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in YOUTUBE_URL_EXTRACT_RE.finditer(str(text or "")):
+        url = match.group(0).rstrip(".,);]}>")
+        video_id = youtube_video_id(url)
+        if video_id and video_id not in seen:
+            seen.add(video_id)
+            urls.append(url)
+    return urls
+
+def youtube_metadata(url: str) -> dict[str, Any]:
+    import yt_dlp
+    video_id = youtube_video_id(url)
+    if not video_id:
+        raise ValueError("Invalid YouTube URL.")
+    options = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
+    with yt_dlp.YoutubeDL(options) as downloader:
+        info = downloader.extract_info(url, download=False)
+    duration = max(0, int(round(float(info.get("duration") or 0))))
+    if duration <= 0:
+        raise RuntimeError("YouTube did not provide a usable video duration.")
+    return {
+        "url": url,
+        "video_id": video_id,
+        "title": str(info.get("title") or f"YouTube video {video_id}"),
+        "duration_seconds": duration,
+    }
+
+def transcript_text(items: Any, start_seconds: float = 0, end_seconds: float | None = None) -> str:
     lines: list[str] = []
     for item in items:
         text = item.get("text", "") if isinstance(item, dict) else getattr(item, "text", "")
+        item_start = float(item.get("start", 0) if isinstance(item, dict) else getattr(item, "start", 0) or 0)
+        item_duration = float(item.get("duration", 0) if isinstance(item, dict) else getattr(item, "duration", 0) or 0)
+        item_end = item_start + item_duration
+        if item_end < start_seconds:
+            continue
+        if end_seconds is not None and item_start > end_seconds:
+            break
         if text:
             lines.append(str(text))
     return "\n".join(lines)
 
-
-def fetch_youtube_transcript(video_id: str) -> str:
+def fetch_youtube_transcript(video_id: str, start_seconds: float = 0, end_seconds: float | None = None) -> str:
     from youtube_transcript_api import YouTubeTranscriptApi
-
     errors: list[str] = []
     try:
         listing = YouTubeTranscriptApi().list(video_id)
@@ -1202,13 +1245,12 @@ def fetch_youtube_transcript(video_id: str) -> str:
             available = list(listing)
             generated = [item for item in available if getattr(item, "is_generated", False)]
             transcript = generated[0] if generated else available[0]
-        text = transcript_text(transcript.fetch())
+        text = transcript_text(transcript.fetch(), start_seconds, end_seconds)
         if text.strip():
             return text
     except Exception as exc:
         errors.append(str(exc))
-
-    try:  # Backward compatibility with older releases.
+    try:
         listing = YouTubeTranscriptApi.list_transcripts(video_id)
         try:
             transcript = listing.find_transcript(["en", "en-GB", "en-US"])
@@ -1216,19 +1258,18 @@ def fetch_youtube_transcript(video_id: str) -> str:
             available = list(listing)
             generated = [item for item in available if getattr(item, "is_generated", False)]
             transcript = generated[0] if generated else available[0]
-        text = transcript_text(transcript.fetch())
+        text = transcript_text(transcript.fetch(), start_seconds, end_seconds)
         if text.strip():
             return text
     except Exception as exc:
         errors.append(str(exc))
-
     raise RuntimeError("; ".join(errors) or "No YouTube transcript is available.")
 
-
-def transcribe_youtube_audio(url: str, video_id: str, job_dir: Path) -> str:
+def transcribe_youtube_audio(
+    url: str, video_id: str, job_dir: Path, start_seconds: float = 0, end_seconds: float | None = None
+) -> str:
     import mlx_whisper
     import yt_dlp
-
     options = {
         "format": "bestaudio/best",
         "outtmpl": str(job_dir / f"{video_id}.%(ext)s"),
@@ -1238,15 +1279,93 @@ def transcribe_youtube_audio(url: str, video_id: str, job_dir: Path) -> str:
             {"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "192"}
         ],
     }
-    log("YouTube audio fallback started", url=url)
+    log("YouTube audio fallback started", url=url, start_seconds=start_seconds, end_seconds=end_seconds)
     with yt_dlp.YoutubeDL(options) as downloader:
         downloader.download([url])
     audio_path = job_dir / f"{video_id}.wav"
     if not audio_path.exists():
         raise RuntimeError("Audio conversion failed. Check that ffmpeg is installed.")
-    result = mlx_whisper.transcribe(str(audio_path), path_or_hf_repo=WHISPER_MODEL)
+    input_path = audio_path
+    if start_seconds > 0 or end_seconds is not None:
+        clipped_path = job_dir / f"{video_id}_segment.wav"
+        command = ["ffmpeg", "-y", "-ss", str(max(0, start_seconds)), "-i", str(audio_path)]
+        if end_seconds is not None:
+            command.extend(["-t", str(max(0.1, end_seconds - start_seconds))])
+        command.extend(["-ac", "1", "-ar", "16000", str(clipped_path)])
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0 or not clipped_path.exists():
+            raise RuntimeError(result.stderr[-1200:] or "ffmpeg could not create the selected audio segment.")
+        input_path = clipped_path
+    result = mlx_whisper.transcribe(str(input_path), path_or_hf_repo=WHISPER_MODEL)
     return str(result.get("text", "")).strip()
 
+def collect_youtube_transcript(segment: dict[str, Any]) -> tuple[str, str, Path]:
+    url = str(segment.get("url") or "").strip()
+    video_id = youtube_video_id(url)
+    if not video_id:
+        raise ValueError(f"Invalid YouTube URL: {url}")
+    duration = max(1, int(segment.get("duration_seconds") or 1))
+    start_seconds = max(0, min(duration - 1, int(segment.get("start_seconds") or 0)))
+    end_seconds = max(start_seconds + 1, min(duration, int(segment.get("end_seconds") or duration)))
+    job_dir = YOUTUBE / f"{video_id}-{uuid.uuid4().hex[:8]}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    method = "YouTube captions"
+    try:
+        transcript = fetch_youtube_transcript(video_id, start_seconds, end_seconds)
+    except Exception as caption_error:
+        log("YouTube captions unavailable", error=repr(caption_error))
+        method = "local MLX Whisper transcription"
+        transcript = transcribe_youtube_audio(url, video_id, job_dir, start_seconds, end_seconds)
+    if not transcript.strip():
+        raise RuntimeError(f"No usable transcript could be generated for {url}.")
+    (job_dir / f"{video_id}_transcript.txt").write_text(transcript, encoding="utf-8")
+    return transcript, method, job_dir
+
+def summarize_youtube_batch(
+    prompt: str, segments: list[dict[str, Any]], model_key: str = DEFAULT_MODEL_KEY
+) -> tuple[str, str, list[dict[str, str]]]:
+    collected: list[tuple[dict[str, Any], str, str]] = []
+    job_dirs: list[Path] = []
+    try:
+        for segment in segments:
+            transcript, method, job_dir = collect_youtube_transcript(segment)
+            job_dirs.append(job_dir)
+            collected.append((segment, transcript, method))
+        transcript_blocks = []
+        sources = []
+        for index, (segment, transcript, method) in enumerate(collected, 1):
+            start_seconds = int(segment.get("start_seconds") or 0)
+            end_seconds = int(segment.get("end_seconds") or segment.get("duration_seconds") or 0)
+            title = str(segment.get("title") or f"YouTube video {index}")
+            url = str(segment.get("url") or "")
+            transcript_blocks.append(
+                f"VIDEO {index}\nTitle: {title}\nURL: {url}\nSelected segment: {start_seconds}s to {end_seconds}s\n"
+                f"Transcript acquisition method: {method}\nTRANSCRIPT:\n{transcript[:MAX_TRANSCRIPT_CHARS]}"
+            )
+            sources.append({"title": title, "url": url})
+        system = (
+            "You are an expert executive analyst. Answer the user's request using the supplied YouTube transcripts. "
+            "When several videos are supplied, compare or synthesize them as the request requires. Do not invent facts or "
+            "claim to have seen visuals not represented in the transcripts. If the prompt is only one or more URLs, use exactly "
+            "these sections: Executive Summary, Key Points, Conclusions.\n\n" + COMMUNICATION_STYLE
+        )
+        user = f"ORIGINAL USER PROMPT:\n{prompt}\n\n" + "\n\n---\n\n".join(transcript_blocks)
+        model_key = normalize_model_key(model_key)
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        output = generate_with_model(model_key, messages, max_tokens=MODEL_OPTIONS[model_key]["max_tokens"], enable_thinking=False if model_key in {"default", "gemma"} else None)
+        reasoning, final_output = strip_think_block(output)
+        if model_key in {"summary", "quick"} or final_answer_missing(final_output):
+            if not reasoning and final_output and model_key in {"summary", "quick"}: reasoning = final_output
+            retry = generate_final_only(model_key, messages, reasoning)
+            leaked, final_output = strip_think_block(retry)
+            if leaked: reasoning = "\n\n".join(part for part in (reasoning, leaked) if part)
+        if final_answer_missing(final_output):
+            raise RuntimeError("The selected model did not produce the YouTube analysis.")
+        return clean_inline_citations(final_output), reasoning, sources
+    finally:
+        for job_dir in job_dirs:
+            for media in job_dir.iterdir():
+                if media.suffix.lower() != ".txt": media.unlink(missing_ok=True)
 
 def summarize_youtube(url: str, model_key: str = DEFAULT_MODEL_KEY) -> tuple[str, str]:
     video_id = youtube_video_id(url)
@@ -1324,7 +1443,7 @@ def summarize_youtube(url: str, model_key: str = DEFAULT_MODEL_KEY) -> tuple[str
 
 
 # -----------------------------------------------------------------------------
-# Professional speech: StyleTTS2 for English and Piper for non-English languages
+# Professional speech: Piper for English and all supported languages
 # -----------------------------------------------------------------------------
 def get_argos_translation(target_code: str):
     """Load English-to-target offline translation without invoking a chat model."""
@@ -1495,7 +1614,7 @@ def ensure_piper_voice(language_code: str) -> tuple[Path, Path]:
 
 
 def get_piper_voice(language_code: str):
-    if language_code == "en" or language_code not in PIPER_VOICE_NAMES:
+    if language_code not in PIPER_VOICE_NAMES:
         raise ValueError(f"Piper is not configured for language: {language_code}")
     with _piper_lock:
         cached = _piper_voices.get(language_code)
@@ -1504,7 +1623,7 @@ def get_piper_voice(language_code: str):
         try:
             from piper import PiperVoice
         except ImportError as exc:
-            raise RuntimeError("Non-English speech requires piper-tts. Install it with: python -m pip install piper-tts") from exc
+            raise RuntimeError("Read Aloud requires piper-tts. Install it with: python -m pip install piper-tts") from exc
         model_path, config_path = ensure_piper_voice(language_code)
         voice_name = PIPER_VOICE_NAMES[language_code]
         log("Piper voice loading", language=LANGUAGES[language_code], voice=voice_name, model=str(model_path))
@@ -1514,9 +1633,32 @@ def get_piper_voice(language_code: str):
         return voice
 
 
+def normalize_english_for_piper(text: str) -> str:
+    """Normalize cased English text for speech before it reaches Piper."""
+    global _nemo_normalizer
+    with _nemo_lock:
+        if _nemo_normalizer is None:
+            try:
+                from nemo_text_processing.text_normalization.normalize import Normalizer
+            except ImportError as exc:
+                raise RuntimeError(
+                    "English Read Aloud requires nemo_text_processing. Install it with: "
+                    "python -m pip install nemo_text_processing"
+                ) from exc
+            log("NeMo English text normalizer loading", input_case="cased")
+            _nemo_normalizer = Normalizer(input_case="cased", lang="en")
+            log("NeMo English text normalizer loaded", input_case="cased")
+        normalized = _nemo_normalizer.normalize(text, verbose=False).strip()
+    if not normalized:
+        raise RuntimeError("NeMo text normalization returned no English text.")
+    log("NeMo English text normalization complete", input_case="cased", input_characters=len(text), output_characters=len(normalized))
+    return normalized
+
 def synthesize_piper(text: str, language_code: str, output_path: Path) -> None:
     voice = get_piper_voice(language_code)
     voice_name = PIPER_VOICE_NAMES[language_code]
+    if language_code == "en":
+        text = normalize_english_for_piper(text)
     log("Piper synthesis started", language=LANGUAGES[language_code], voice=voice_name, characters=len(text))
     with _piper_lock:
         with wave.open(str(output_path), "wb") as wav_file:
@@ -1913,6 +2055,21 @@ def search_suggestions_route():
         return jsonify(error=str(exc)), 500
 
 
+@app.post("/api/youtube_metadata")
+def youtube_metadata_route():
+    data = request.get_json(force=True)
+    urls = data.get("urls") or extract_youtube_urls(str(data.get("prompt") or ""))
+    if not urls:
+        return jsonify(videos=[]), 200
+    videos = []
+    try:
+        for url in urls:
+            videos.append(youtube_metadata(str(url)))
+        return jsonify(videos=videos)
+    except Exception as exc:
+        log("YouTube metadata failed", error=repr(exc))
+        return jsonify(error=str(exc)), 500
+
 @app.post("/api/chat")
 def chat():
     data = request.get_json(force=True)
@@ -1955,10 +2112,22 @@ def chat():
     try:
         response_type = "standard"
         reasoning = ""
-        if YOUTUBE_URL_RE.fullmatch(prompt):
-            response_type = "youtube_summary"
-            output, reasoning = summarize_youtube(prompt, model_key)
-            sources = [{"title": "YouTube video", "url": prompt}]
+        youtube_urls = extract_youtube_urls(prompt)
+        youtube_segments = data.get("youtube_segments") or []
+        if youtube_urls:
+            if not youtube_segments:
+                youtube_segments = []
+                for url in youtube_urls:
+                    metadata = youtube_metadata(url)
+                    youtube_segments.append({**metadata, "start_seconds": 0, "end_seconds": metadata["duration_seconds"]})
+            requested_ids = [youtube_video_id(url) for url in youtube_urls]
+            supplied = {youtube_video_id(str(item.get("url") or "")): item for item in youtube_segments}
+            missing = [video_id for video_id in requested_ids if video_id not in supplied]
+            if missing:
+                raise ValueError("Segment selections are missing for one or more YouTube URLs.")
+            ordered_segments = [supplied[video_id] for video_id in requested_ids]
+            response_type = "youtube_summary" if len(youtube_urls) == 1 and YOUTUBE_URL_RE.fullmatch(prompt) else "standard"
+            output, reasoning, sources = summarize_youtube_batch(prompt, ordered_segments, model_key)
             current_session["history"].extend(
                 [{"role": "user", "content": prompt}, {"role": "assistant", "content": output}]
             )
@@ -2028,7 +2197,7 @@ def tts():
     if language_code not in LANGUAGES:
         return jsonify(error="Unsupported speech language."), 400
     try:
-        engine_name = "StyleTTS2" if language_code == "en" else "Piper"
+        engine_name = "Piper"
         log(
             "TTS requested",
             engine=engine_name,
@@ -2039,24 +2208,21 @@ def tts():
         spoken = translate_for_speech(text, language_code)
         filename = f"speech-{uuid.uuid4().hex}.wav"
         output_path = AUDIO / filename
-        if language_code == "en":
-            synthesize_styletts2(spoken, output_path)
-        else:
-            synthesize_piper(spoken, language_code, output_path)
+        synthesize_piper(spoken, language_code, output_path)
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise RuntimeError(f"{engine_name} produced no audio file")
         log(
             "TTS ready",
             engine=engine_name,
             language=LANGUAGES[language_code],
-            voice=(PIPER_VOICE_NAMES.get(language_code) if language_code != "en" else "StyleTTS2 default"),
+            voice=PIPER_VOICE_NAMES.get(language_code),
             bytes=output_path.stat().st_size,
         )
         return jsonify(
             audio_url=f"/audio/{filename}",
             engine=engine_name,
             language=language_code,
-            voice=(PIPER_VOICE_NAMES.get(language_code) if language_code != "en" else "StyleTTS2 default"),
+            voice=PIPER_VOICE_NAMES.get(language_code),
         )
     except Exception as exc:
         log("TTS failed", language=language_code, error=repr(exc))
@@ -2071,12 +2237,14 @@ def audio(filename: str):
         AUDIO,
         filename,
         mimetype="audio/wav",
-        conditional=False,
+        conditional=True,
         as_attachment=False,
     )
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
+    response.headers["Accept-Ranges"] = "bytes"
+    response.headers["X-Content-Type-Options"] = "nosniff"
     return response
 
 
@@ -2166,6 +2334,7 @@ button,.upload,select{border:1px solid var(--line);background:#fff;border-radius
 .reasoning-block{margin:10px 0;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#00000005}.reasoning-block summary{cursor:pointer;font-size:13px;font-weight:650;color:var(--muted)}.reasoning-content{margin-top:8px;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45}.meta{display:flex;gap:14px;align-items:center;margin-top:9px;font-size:12px}.copy-link{border:0;background:transparent!important;padding:0;color:var(--blue);font-size:12px}.copy-link:hover{text-decoration:underline}
 .youtube-sections{display:grid;gap:14px;margin-top:8px}.youtube-section{border:1px solid var(--line);border-radius:11px;padding:14px;background:#fbfcfe}.youtube-section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:9px}.youtube-section-title{font-size:17px;font-weight:700}.youtube-section-tools{display:flex;gap:6px;align-items:center;flex-shrink:0}.youtube-section-tools select,.youtube-section-tools button{padding:5px 8px;font-size:12px}.youtube-section-body{line-height:1.58}
 input[type=file]{display:none}audio{width:min(520px,100%)}
+.youtube-modal-backdrop{position:fixed;inset:0;z-index:100;background:#0009;display:flex;align-items:center;justify-content:center;padding:18px}.youtube-modal{width:min(760px,100%);max-height:88vh;overflow:auto;background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:0 20px 60px #0005;padding:20px}.youtube-modal h2{margin:0 0 5px}.youtube-modal-list{display:grid;gap:14px;margin:16px 0}.youtube-segment-card{border:1px solid var(--line);border-radius:11px;padding:13px}.youtube-video-title{font-weight:700;margin-bottom:4px}.youtube-video-url-row{display:flex;gap:8px;align-items:center}.youtube-video-url{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px}.youtube-copy-url{padding:4px 7px;font-size:11px;flex:0 0 auto}.youtube-time-row{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;margin-top:12px}.youtube-time-value{font-variant-numeric:tabular-nums;font-weight:700;text-align:center}.youtube-range{width:100%;padding:0;border:0}.youtube-modal-actions{display:flex;justify-content:flex-end;gap:9px}.youtube-modal-error{color:#b42318;font-size:13px;margin-top:8px}:root[data-theme="dark"] .youtube-modal{background:#1c1d21}
 @media(max-width:700px){.search-grid{grid-template-columns:1fr}.search-field.full{grid-column:auto}.response-head{display:block}.response-tools{margin:5px 0 10px}.bar{align-items:flex-start}}
 :root[data-theme="dark"] body{background:#111215;color:#f3f3f5}:root[data-theme="dark"] .card{background:#1c1d21;border-color:#34353b}:root[data-theme="dark"] textarea,:root[data-theme="dark"] button,:root[data-theme="dark"] .upload,:root[data-theme="dark"] select{background:#25262b;color:#f3f3f5;border-color:#45464d}:root[data-theme="dark"] .turn{border-color:#34353b}:root[data-theme="dark"] .live-activity,:root[data-theme="dark"] .search-panel{background:#23252a}:root[data-theme="dark"] .search-suggestions{background:#202227}:root[data-theme="dark"] .search-result.excluded{background:#191a1e}:root[data-theme="dark"] .search-batch-heading{background:#292c32}:root[data-theme="dark"] .youtube-section{background:#202227}:root[data-theme="dark"] .language-picker summary,:root[data-theme="dark"] .language-popout{background:#25262b;color:#f3f3f5;border-color:#45464d}
 .system-health{position:sticky;top:0;z-index:30;display:flex;align-items:center;justify-content:center;gap:5px;min-height:24px;margin:-12px 54px 8px;padding:4px 8px;background:#fff;border-bottom:1px solid transparent;color:var(--muted);font-size:10.5px;line-height:1.25;letter-spacing:.01em;white-space:nowrap}.system-health .health-label{font-weight:600;color:inherit}.system-health .health-value{font-variant-numeric:tabular-nums}.system-health .health-separator{opacity:.55}.system-health[data-level="high"]{color:#a15c00}.system-health[data-level="critical"]{color:#b42318}:root[data-theme="dark"] .system-health[data-level="high"]{color:#f0b35b}:root[data-theme="dark"] .system-health{background:#1c1d21}:root[data-theme="dark"] .system-health[data-level="critical"]{color:#ff8178}@media(max-width:680px){.system-health{margin:-8px 46px 9px;white-space:normal;text-align:center;flex-wrap:wrap}}
@@ -2214,6 +2383,15 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
 <div class="files" id="fileList">No files attached.</div>
 <div class="audio"><label>Playback speed <select id="speed"><option value="0.75">0.75x</option><option value="1" selected>1.0x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2.0x</option></select></label><audio id="player" controls></audio></div>
 <div id="history"></div>
+<div id="youtubeModalBackdrop" class="youtube-modal-backdrop" hidden>
+  <section class="youtube-modal" role="dialog" aria-modal="true" aria-labelledby="youtubeModalTitle">
+    <h2 id="youtubeModalTitle">Select YouTube transcription segments</h2>
+    <div class="sub">Choose the start and finish for each video. The full duration is selected by default.</div>
+    <div id="youtubeModalList" class="youtube-modal-list"></div>
+    <div id="youtubeModalError" class="youtube-modal-error" aria-live="polite"></div>
+    <div class="youtube-modal-actions"><button type="button" id="youtubeCancel">Cancel</button><button type="button" class="primary" id="youtubeContinue">Transcribe selected segments</button></div>
+  </section>
+</div>
 </section></main>
 <script>
 let sid=crypto.randomUUID(),latest='',searchSuggestionGroups={};
@@ -2399,17 +2577,19 @@ function addTurn(prompt,answer,sources,elapsed,responseType='standard',reasoning
 async function setMicMuted(muted){if(!$('live').textContent.includes('Stop'))return false;const r=await fetch('/api/live_mute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({muted})});const d=await r.json();if(!r.ok)throw Error(d.error||'Microphone mute failed');$('micMute').disabled=!d.active;$('micMute').textContent=d.muted?'🎤 Unmute mic':'🔇 Mute mic';$('status').textContent=d.muted?'Live mode active — microphone muted':'Listening for a spoken prompt...';showLiveActivity(null,d.muted?'Microphone muted.':'Listening for a spoken prompt...',true);return d.muted}
 async function loadAudioIntoPlayer(audioUrl){
   const player=$('player');
-  const url=audioUrl+(audioUrl.includes('?')?'&':'?')+'v='+Date.now();
-  player.pause(); player.src=url; player.playbackRate=Number($('speed').value); player.load();
-  await new Promise((resolve,reject)=>{
+  const baseUrl=audioUrl+(audioUrl.includes('?')?'&':'?')+'v='+Date.now();
+  const loadAttempt=attempt=>new Promise((resolve,reject)=>{
     let done=false;
-    const cleanup=()=>{player.removeEventListener('loadeddata',ready);player.removeEventListener('canplay',ready);player.removeEventListener('error',failed)};
+    const cleanup=()=>{player.removeEventListener('loadedmetadata',ready);player.removeEventListener('loadeddata',ready);player.removeEventListener('canplay',ready);player.removeEventListener('error',failed)};
     const ready=()=>{if(done)return;done=true;cleanup();resolve()};
     const failed=()=>{if(done)return;done=true;cleanup();reject(Error('Safari could not load the generated WAV file.'))};
-    player.addEventListener('loadeddata',ready);player.addEventListener('canplay',ready);player.addEventListener('error',failed);
-    if(player.readyState>=2)ready();
-    setTimeout(()=>{if(!done){done=true;cleanup();reject(Error('Timed out loading generated audio.'))}},15000);
+    player.addEventListener('loadedmetadata',ready);player.addEventListener('loadeddata',ready);player.addEventListener('canplay',ready);player.addEventListener('error',failed);
+    player.pause();player.removeAttribute('src');player.load();
+    player.src=baseUrl+'&attempt='+attempt;player.playbackRate=Number($('speed').value);player.load();
+    if(player.readyState>=1)ready();
+    setTimeout(()=>{if(!done){done=true;cleanup();reject(Error('Timed out loading generated audio.'))}},20000);
   });
+  try{await loadAttempt(1)}catch(firstError){console.warn('Initial Safari audio load failed; retrying automatically.',firstError);await new Promise(resolve=>setTimeout(resolve,350));await loadAttempt(2)}
 }
 async function playCachedAudio(button){
   if(!button.dataset.audioUrl)return false;
@@ -2545,7 +2725,11 @@ $('runSearch').onclick=async()=>{
   }catch(error){$('searchStatus').textContent='Search error: '+error.message}
   finally{$('runSearch').disabled=false;$('send').disabled=false}
 };
-$('send').onclick=async()=>{const p=$('prompt').value.trim();if(!p)return;const started=performance.now();const isYoutube=/^https?:\/\/(?:www\.|m\.)?(?:youtube\.com|youtu\.be)\//i.test(p);busy(true,isYoutube?'Getting transcript and generating executive summary...':'Reasoning over the approved evidence...');try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,prompt:p,use_search_results:true,selected_source_indices:selectedSearchResultIndices(),selected_source_urls:selectedSearchResultUrls(),max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})});const d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;const elapsed=Number(d.elapsed_seconds||((performance.now()-started)/1000));addTurn(p,d.answer,d.sources,elapsed,d.response_type||'standard',d.reasoning||'',d.model_label||'');$('prompt').value='';busy(false,`Complete in ${elapsed.toFixed(2)}s`);beep()}catch(e){busy(false,'Error: '+e.message)}};
+function formatYoutubeTime(totalSeconds){const seconds=Math.max(0,Math.round(Number(totalSeconds)||0));const minutes=Math.floor(seconds/60);return `${String(minutes).padStart(2,'0')}:${String(seconds%60).padStart(2,'0')}`}
+function extractYoutubeUrlsFromPrompt(text){const regex=/https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:[^\s#]*&)?v=|shorts\/|live\/|embed\/)|youtu\.be\/)[A-Za-z0-9_-]{11}[^\s<>'"]*/gi;const seen=new Set();return (String(text).match(regex)||[]).map(url=>url.replace(/[.,);\]}]+$/,'')).filter(url=>{const id=url.match(/(?:v=|youtu\.be\/|shorts\/|live\/|embed\/)([A-Za-z0-9_-]{11})/i)?.[1];if(!id||seen.has(id))return false;seen.add(id);return true})}
+function youtubeSegmentCard(video,index){return `<article class="youtube-segment-card" data-index="${index}" data-url="${esc(video.url)}" data-title="${esc(video.title)}" data-duration="${video.duration_seconds}"><div class="youtube-video-title">${esc(video.title)}</div><div class="youtube-video-url-row"><div class="youtube-video-url" title="${esc(video.url)}">${esc(video.url)}</div><button type="button" class="youtube-copy-url">Copy URL</button></div><div class="youtube-time-row"><div><div class="youtube-time-value start-label">00:00</div><input class="youtube-range youtube-start" type="range" min="0" max="${video.duration_seconds}" step="1" value="0" aria-label="Transcription start"></div><span>to</span><div><div class="youtube-time-value end-label">${formatYoutubeTime(video.duration_seconds)}</div><input class="youtube-range youtube-end" type="range" min="0" max="${video.duration_seconds}" step="1" value="${video.duration_seconds}" aria-label="Transcription finish"></div></div></article>`}
+async function chooseYoutubeSegments(prompt){const urls=extractYoutubeUrlsFromPrompt(prompt);if(!urls.length)return [];const response=await fetch('/api/youtube_metadata',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})});const data=await response.json();if(!response.ok)throw Error(data.error||'Could not read YouTube video details.');$('youtubeModalList').innerHTML=data.videos.map(youtubeSegmentCard).join('');$('youtubeModalError').textContent='';$('youtubeModalBackdrop').hidden=false;const cards=Array.from(document.querySelectorAll('.youtube-segment-card'));cards.forEach(card=>{const start=card.querySelector('.youtube-start'),end=card.querySelector('.youtube-end'),startLabel=card.querySelector('.start-label'),endLabel=card.querySelector('.end-label');const update=changed=>{let a=Number(start.value),b=Number(end.value);if(a>=b){if(changed===start)a=Math.max(0,b-1);else b=Math.min(Number(end.max),a+1);start.value=a;end.value=b}startLabel.textContent=formatYoutubeTime(a);endLabel.textContent=formatYoutubeTime(b)};start.oninput=()=>update(start);end.oninput=()=>update(end);card.querySelector('.youtube-copy-url').onclick=async event=>{await navigator.clipboard.writeText(card.dataset.url);const button=event.currentTarget,old=button.textContent;button.textContent='Copied';setTimeout(()=>button.textContent=old,1200)}});return await new Promise(resolve=>{$('youtubeCancel').onclick=()=>{$('youtubeModalBackdrop').hidden=true;resolve(null)};$('youtubeContinue').onclick=()=>{const segments=cards.map(card=>({url:card.dataset.url,title:card.dataset.title,duration_seconds:Number(card.dataset.duration),start_seconds:Number(card.querySelector('.youtube-start').value),end_seconds:Number(card.querySelector('.youtube-end').value)}));$('youtubeModalBackdrop').hidden=true;resolve(segments)}})}
+$('send').onclick=async()=>{const p=$('prompt').value.trim();if(!p)return;const started=performance.now();const youtubeUrls=extractYoutubeUrlsFromPrompt(p);let youtubeSegments=[];try{if(youtubeUrls.length){busy(true,'Loading YouTube video details...');youtubeSegments=await chooseYoutubeSegments(p);if(youtubeSegments===null){busy(false,'YouTube transcription cancelled.');return}}busy(true,youtubeUrls.length?`Transcribing ${youtubeUrls.length} selected video segment${youtubeUrls.length===1?'':'s'}...`:'Reasoning over the approved evidence...');const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,prompt:p,youtube_segments:youtubeSegments,use_search_results:true,selected_source_indices:selectedSearchResultIndices(),selected_source_urls:selectedSearchResultUrls(),max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})});const d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;const elapsed=Number(d.elapsed_seconds||((performance.now()-started)/1000));addTurn(p,d.answer,d.sources,elapsed,d.response_type||'standard',d.reasoning||'',d.model_label||'');$('prompt').value='';busy(false,`Complete in ${elapsed.toFixed(2)}s`);beep()}catch(e){$('youtubeModalBackdrop').hidden=true;busy(false,'Error: '+e.message)}};
 $('prompt').onkeydown=e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')$('send').click()};
 $('files').onchange=async()=>{const selectedFiles=Array.from($('files').files);if(selectedFiles.length>15){$('status').textContent='Select no more than 15 documents at once.';$('files').value='';return}const fd=new FormData();fd.append('session_id',sid);for(const file of selectedFiles)fd.append('files',file);busy(true,'Reading files...');try{const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;$('fileList').textContent=(d.added.length?'Attached: '+d.added.map(x=>`${x.name} (${x.characters.toLocaleString()} chars)`).join(', '):'No files attached.')+(d.errors.length?' Errors: '+d.errors.map(x=>x.name+': '+x.error).join('; '):'');busy(false,'Files ready')}catch(e){busy(false,'Error: '+e.message)}finally{$('files').value=''}};
 $('speed').onchange=()=>$('player').playbackRate=Number($('speed').value);
