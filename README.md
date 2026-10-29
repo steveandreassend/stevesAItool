@@ -1,6 +1,6 @@
 # Steve's AI Tool
 
-A local-first research and analysis application for Apple Silicon Macs. It combines local MLX language models, Exa web search, document analysis, YouTube summarization, live voice input, multilingual read-aloud, and a browser-based interface in a single Python application.
+A local-first research and analysis application for Apple Silicon Macs. It combines local MLX language models, Exa web search, document analysis, multimedia audio analysis, webpage analysis, YouTube summarization, live voice input, multilingual read-aloud, and a browser-based interface in a single Python application.
 
 The application is designed for research workflows where you want local model inference and direct control over the evidence supplied to the model, while retaining the option to retrieve current web content through Exa.
 
