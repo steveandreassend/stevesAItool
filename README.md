@@ -31,11 +31,13 @@ The application is designed for research workflows where you want local model in
 
 **Reasoning:**
 - **Bulk document analysis** - Upload up to 15 documents at a time. Copilot limits you to 3.
+- **Multimedia analysis** - Extract the audio from any video or audio file, and reason upon it.
+- **Webpage analysis** - Specify the URL to any article in any language, and reason upon it.
 - **Model selection** - Choice of models from Google, Qwen, Deepseek depending on the chosen task - whether it be fast summarization or slow deep reasoning.
 - **Switch models** - Switch between models during the chat.
 - **Ease of use** - Automatically downloads a model from Hugging Face the first time you select it.
 - **Large context windows** - Up to an 8X larger context window (262K) than some of the major commercial services (16K).
-- **Youtube transcription** - Transcribes the audio of any Youtube video in any language, even if there are no subtitles, for analysis and reasoning. No more sitting through long seminars or lectures.
+- **Youtube transcription** - Transcribes the audio of any Youtube video in any language, even if there are no subtitles, for analysis and reasoning. No more sitting through long seminars or lectures. Control which segment of the audio to analyze by defining the start and end boundaries.
 - **Reasoning** - Shows the reasoning so you can understand how conclusions were reached.
 - **Notifications** - Notifications - it rings a bell when it’s done. You can mute that too.
 
@@ -161,6 +163,14 @@ The integrated Exa search interface supports:
 
 > Exa is the only core feature that requires a third-party API key and an internet connection. Local model inference does not require an external model API after the model files have been downloaded.
 
+### Webpage analysis
+
+Paste the article to any URL and the selected LLM will examine it and respond to your prompt.
+
+### Local multimedia analysis
+
+Attach a media file and the audio will be transcribed and examined by the LLM along with the prompt. Supported formats are any types supported by ffmpeg.
+
 ### Local document analysis
 
 Attach up to 15 documents in one upload. Supported formats are:
@@ -189,7 +199,7 @@ Text is extracted locally and added to the active research session. PDF, Word, a
 
 ### YouTube summarization
 
-Paste a supported single-video YouTube URL into the prompt field. The application:
+Paste a supported single-video YouTube URL into the prompt field. The user is prompted for the start and end of the audio segment to analyze, defaulting to the entire clip. The application:
 
 1. Attempts to retrieve an available transcript.
 2. Falls back to downloading the audio and transcribing it locally with MLX Whisper.
@@ -379,7 +389,10 @@ python -m pip install \
   pydub \
   psutil \
   numpy \
-  nltk
+  nltk \
+  trafilatura \
+  beautifulsoup4 \
+  lxml
 ```
 
 Install NeMo Text Processing without dependency resolution, then install the additional libraries it requires:

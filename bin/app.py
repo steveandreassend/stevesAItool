@@ -15,6 +15,9 @@ Features:
 from __future__ import annotations
 
 import atexit
+import html as html_lib
+import ipaddress
+import socket
 from datetime import datetime, timedelta, timezone
 import functools
 import gc
@@ -31,7 +34,7 @@ import uuid
 import wave
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urljoin
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -46,8 +49,9 @@ TEMP = ROOT / "temp"
 UPLOADS = TEMP / "uploads"
 AUDIO = TEMP / "audio"
 YOUTUBE = TEMP / "youtube"
+MEDIA = TEMP / "media"
 PIPER_VOICES_DIR = ROOT / "voices" / "piper"
-for directory in (TEMP, UPLOADS, AUDIO, YOUTUBE, PIPER_VOICES_DIR):
+for directory in (TEMP, UPLOADS, AUDIO, YOUTUBE, MEDIA, PIPER_VOICES_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 MODEL_OPTIONS = {
@@ -107,9 +111,13 @@ MAX_FILE_CHARS = int(os.getenv("MAX_FILE_CHARS", "120000"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12"))
 MAX_WEB_RESULTS = int(os.getenv("MAX_WEB_RESULTS", "8"))
 MAX_UPLOAD_FILES = 15
+MAX_MEDIA_BYTES = int(os.getenv("MAX_MEDIA_BYTES", str(2 * 1024 * 1024 * 1024)))
 EXA_QUERY_HISTORY_TURNS = int(os.getenv("EXA_QUERY_HISTORY_TURNS", "6"))
 EXA_QUERY_MAX_TOKENS = int(os.getenv("EXA_QUERY_MAX_TOKENS", "180"))
 MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "500000"))
+MAX_ARTICLE_CHARS = int(os.getenv("MAX_ARTICLE_CHARS", "350000"))
+MAX_ARTICLE_URLS = int(os.getenv("MAX_ARTICLE_URLS", "5"))
+ARTICLE_FETCH_TIMEOUT = int(os.getenv("ARTICLE_FETCH_TIMEOUT", "30"))
 LIVE_MIN_THRESHOLD = float(os.getenv("LIVE_MIN_THRESHOLD", "0.006"))
 LIVE_SILENCE_SECONDS = float(os.getenv("LIVE_SILENCE_SECONDS", "1.75"))
 LIVE_MAX_UTTERANCE_SECONDS = float(os.getenv("LIVE_MAX_UTTERANCE_SECONDS", "30"))
@@ -117,6 +125,10 @@ LIVE_MAX_UTTERANCE_SECONDS = float(os.getenv("LIVE_MAX_UTTERANCE_SECONDS", "30")
 ALLOWED_EXTENSIONS = {
     ".txt", ".md", ".csv", ".json", ".py", ".log",
     ".html", ".xml", ".pdf", ".docx", ".xlsx",
+}
+MEDIA_EXTENSIONS = {
+    ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif",
+    ".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".wmv", ".mpeg", ".mpg",
 }
 LANGUAGES = {
     "en": "English",
@@ -169,6 +181,8 @@ YOUTUBE_URL_RE = re.compile(
     r"[A-Za-z0-9_-]{11}(?:[?&/#].*)?$",
     re.I,
 )
+ARTICLE_URL_EXTRACT_RE = re.compile(r"https?://[^\s<>\'\"]+", re.I)
+
 YOUTUBE_URL_EXTRACT_RE = re.compile(
     r"https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?(?:[^\s#]*&)?v=|shorts/|live/|embed/)|youtu\.be/)"
     r"[A-Za-z0-9_-]{11}(?:[^\s<>'\"]*)?",
@@ -176,7 +190,7 @@ YOUTUBE_URL_EXTRACT_RE = re.compile(
 )
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_MEDIA_BYTES
 
 class PollingAccessFilter(logging.Filter):
     """Suppress routine browser polling requests from the Werkzeug access log."""
@@ -249,7 +263,7 @@ def log(event: str, **fields: Any) -> None:
 
 def get_session(session_id: str) -> dict[str, Any]:
     with sessions_lock:
-        return sessions.setdefault(session_id, {"history": [], "files": [], "search": None})
+        return sessions.setdefault(session_id, {"history": [], "files": [], "search": None, "media": None})
 
 
 def normalize_model_key(model_key: str | None) -> str:
@@ -578,6 +592,90 @@ def extract_text(path: Path) -> str:
 
     return text[:MAX_FILE_CHARS]
 
+
+# -----------------------------------------------------------------------------
+# Local audio and video transcription
+# -----------------------------------------------------------------------------
+def probe_media(path: Path) -> dict[str, Any]:
+    command = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-1200:] or "ffprobe could not inspect the media file.")
+    try:
+        duration = max(1, int(round(float(result.stdout.strip()))))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("The media file does not report a usable duration.") from exc
+    return {"duration_seconds": duration}
+
+def transcribe_local_media(
+    media_path: Path, job_dir: Path, start_seconds: float = 0, end_seconds: float | None = None
+) -> str:
+    import mlx_whisper
+    clipped_path = job_dir / "selected_segment.wav"
+    command = ["ffmpeg", "-y", "-ss", str(max(0, start_seconds)), "-i", str(media_path)]
+    if end_seconds is not None:
+        command.extend(["-t", str(max(0.1, end_seconds - start_seconds))])
+    command.extend(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(clipped_path)])
+    log("Local media conversion started", file=media_path.name, start_seconds=start_seconds, end_seconds=end_seconds)
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0 or not clipped_path.exists():
+        raise RuntimeError(result.stderr[-1600:] or "ffmpeg could not create the selected media segment.")
+    transcription = mlx_whisper.transcribe(str(clipped_path), path_or_hf_repo=WHISPER_MODEL, task="transcribe")
+    return str(transcription.get("text", "")).strip()
+
+def analyze_local_media(
+    prompt: str, media: dict[str, Any], segment: dict[str, Any], model_key: str = DEFAULT_MODEL_KEY
+) -> tuple[str, str, list[dict[str, str]]]:
+    media_path = Path(str(media.get("path") or ""))
+    if not media_path.exists() or media_path.parent != MEDIA / secure_filename(str(media.get("session_id") or "")):
+        raise ValueError("The uploaded media file is no longer available. Upload it again.")
+    duration = max(1, int(media.get("duration_seconds") or 1))
+    start_seconds = max(0, min(duration - 1, int(segment.get("start_seconds") or 0)))
+    end_seconds = max(start_seconds + 1, min(duration, int(segment.get("end_seconds") or duration)))
+    job_dir = media_path.parent / f"transcription-{uuid.uuid4().hex[:8]}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        transcript = transcribe_local_media(media_path, job_dir, start_seconds, end_seconds)
+        if not transcript:
+            raise RuntimeError("No usable speech transcript could be generated from the selected segment.")
+        transcript_path = media_path.parent / f"{media_path.stem}_transcript_{start_seconds}-{end_seconds}.txt"
+        transcript_path.write_text(transcript, encoding="utf-8")
+        system = (
+            "You are an expert executive analyst. Answer the user's request using the supplied transcript from an uploaded "
+            "audio or video file. Do not invent facts or claim to have seen visuals that are not represented in the transcript. "
+            "If the user's prompt contains no specific analytical instruction, use exactly these sections: Executive Summary, "
+            "Key Points, Conclusions.\n\n" + COMMUNICATION_STYLE
+        )
+        user = (
+            f"ORIGINAL USER PROMPT:\n{prompt}\n\n"
+            f"UPLOADED MEDIA FILE: {media.get('name') or media_path.name}\n"
+            f"SELECTED SEGMENT: {start_seconds}s to {end_seconds}s\n"
+            f"TRANSCRIPTION METHOD: local MLX Whisper\n\n"
+            f"TRANSCRIPT:\n{transcript[:MAX_TRANSCRIPT_CHARS]}"
+        )
+        selected_key = normalize_model_key(model_key)
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        output = generate_with_model(
+            selected_key, messages, max_tokens=MODEL_OPTIONS[selected_key]["max_tokens"],
+            enable_thinking=False if selected_key in {"default", "gemma"} else None,
+        )
+        reasoning, final_output = strip_think_block(output)
+        if selected_key in {"summary", "quick"} or final_answer_missing(final_output):
+            if not reasoning and final_output and selected_key in {"summary", "quick"}:
+                reasoning = final_output
+            retry = generate_final_only(selected_key, messages, reasoning)
+            leaked, final_output = strip_think_block(retry)
+            if leaked:
+                reasoning = "\n\n".join(part for part in (reasoning, leaked) if part)
+        if final_answer_missing(final_output):
+            raise RuntimeError("The selected model did not produce an analysis of the uploaded media.")
+        source = {"title": str(media.get("name") or media_path.name), "url": ""}
+        return clean_inline_citations(final_output), reasoning, [source]
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 # -----------------------------------------------------------------------------
 # Exa retrieval and Qwen final synthesis
@@ -1167,6 +1265,229 @@ def generate_search_suggestions(
     log("Search suggestions generated", model_key=selected_key, suggestions=suggestions)
     return suggestions
 
+
+# -----------------------------------------------------------------------------
+# Direct article retrieval and summarization
+# -----------------------------------------------------------------------------
+def extract_article_urls(text: str) -> list[str]:
+    """Return unique non-YouTube HTTP(S) URLs in prompt order."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in ARTICLE_URL_EXTRACT_RE.finditer(str(text or "")):
+        url = match.group(0).rstrip(".,);]}>'\\\"")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or youtube_video_id(url):
+            continue
+        key = url.rstrip("/").lower()
+        if key not in seen:
+            seen.add(key)
+            urls.append(url)
+        if len(urls) >= MAX_ARTICLE_URLS:
+            break
+    return urls
+
+
+def validate_public_article_url(url: str) -> str:
+    """Reject unsupported schemes, credentials, localhost and private-network targets."""
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Article URLs must start with http:// or https://.")
+    if parsed.username or parsed.password:
+        raise ValueError("Article URLs containing credentials are not allowed.")
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("Localhost URLs are not allowed.")
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve article website: {host}") from exc
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            raise ValueError("Private, local, reserved and link-local article addresses are not allowed.")
+    return parsed.geturl()
+
+
+def fetch_article_html(url: str) -> tuple[str, str, str]:
+    """Fetch a public webpage directly, following only validated public redirects."""
+    current = validate_public_article_url(url)
+    opener = __import__("urllib.request", fromlist=["build_opener"]).build_opener(
+        __import__("urllib.request", fromlist=["HTTPHandler"]).HTTPHandler(),
+        __import__("urllib.request", fromlist=["HTTPSHandler"]).HTTPSHandler(),
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.8,*;q=0.5",
+    }
+    for _ in range(6):
+        req = Request(current, headers=headers, method="GET")
+        try:
+            with opener.open(req, timeout=ARTICLE_FETCH_TIMEOUT) as response:
+                final_url = validate_public_article_url(response.geturl())
+                content_type = str(response.headers.get("Content-Type") or "").lower()
+                if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                    raise ValueError(f"The URL returned {content_type or 'a non-HTML document'}, not a webpage.")
+                limit = 8 * 1024 * 1024
+                raw = response.read(limit + 1)
+                if len(raw) > limit:
+                    raise ValueError("The webpage is larger than the 8 MB direct-reading limit.")
+                charset = response.headers.get_content_charset() or "utf-8"
+                return raw.decode(charset, errors="replace"), final_url, content_type
+        except HTTPError as exc:
+            raise RuntimeError(f"Website returned HTTP {exc.code} for {current}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Could not retrieve the article: {exc.reason}") from exc
+    raise RuntimeError("Too many redirects while retrieving the article.")
+
+
+def article_metadata_from_html(html: str, url: str) -> dict[str, str]:
+    title = ""
+    author = ""
+    published = ""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        def meta_value(*keys: tuple[str, str]) -> str:
+            for attribute, value_ in keys:
+                tag = soup.find("meta", attrs={attribute: value_})
+                if tag and tag.get("content"):
+                    return str(tag.get("content")).strip()
+            return ""
+        title = meta_value(("property", "og:title"), ("name", "twitter:title"))
+        if not title and soup.title:
+            title = soup.title.get_text(" ", strip=True)
+        author = meta_value(("name", "author"), ("property", "article:author"))
+        published = meta_value(("property", "article:published_time"), ("name", "date"), ("name", "pubdate"))
+    except Exception:
+        match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I | re.S)
+        title = html_lib.unescape(re.sub(r"<[^>]+>", " ", match.group(1))).strip() if match else ""
+    domain = (urlparse(url).hostname or "").removeprefix("www.")
+    return {"title": title or domain or "Web article", "author": author, "published_date": published, "domain": domain}
+
+
+def fallback_article_extraction(html: str) -> str:
+    """DOM-density fallback that prefers article/main content and removes page chrome."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript", "svg", "canvas", "form", "button", "input", "select", "textarea", "nav", "header", "footer", "aside"]):
+        tag.decompose()
+    noise = re.compile(
+        r"advert|advertisement|banner|breadcrumb|cookie|consent|footer|header|menu|nav|newsletter|"
+        r"paywall|popup|promo|recommend|related|share|sidebar|social|sponsor|subscribe|toolbar",
+        re.I,
+    )
+    for node in list(soup.find_all(True)):
+        marker = " ".join([str(node.get("id") or ""), " ".join(node.get("class") or [])])
+        if marker and noise.search(marker):
+            node.decompose()
+    candidates = list(soup.find_all("article")) + list(soup.find_all("main"))
+    candidates += list(soup.find_all(["section", "div"], limit=1200))
+    best_text = ""
+    best_score = -1.0
+    for node in candidates:
+        paragraphs = [p.get_text(" ", strip=True) for p in node.find_all(["p", "h1", "h2", "h3", "li"], recursive=True)]
+        paragraphs = [re.sub(r"\s+", " ", item).strip() for item in paragraphs if len(item.split()) >= 4]
+        text = "\n\n".join(dict.fromkeys(paragraphs))
+        if len(text) < 200:
+            continue
+        links = " ".join(a.get_text(" ", strip=True) for a in node.find_all("a"))
+        punctuation = text.count(".") + text.count("!") + text.count("?")
+        score = len(text) + punctuation * 35 - len(links) * 1.5
+        if node.name == "article":
+            score *= 1.35
+        elif node.name == "main":
+            score *= 1.15
+        if score > best_score:
+            best_score, best_text = score, text
+    if best_text:
+        return best_text
+    return re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
+
+
+def extract_article_text(html: str, url: str) -> tuple[str, str]:
+    """Use article-aware extraction first, then a local DOM-density fallback."""
+    text = ""
+    method = "BeautifulSoup article-density fallback"
+    try:
+        import trafilatura
+        text = trafilatura.extract(
+            html,
+            url=url,
+            include_comments=False,
+            include_tables=True,
+            include_links=False,
+            include_images=False,
+            favor_precision=True,
+            deduplicate=True,
+            output_format="txt",
+        ) or ""
+        if len(text.split()) >= 80:
+            method = "Trafilatura main-content extraction"
+    except ImportError:
+        pass
+    except Exception as exc:
+        log("Trafilatura extraction warning", url=url, error=repr(exc))
+    if len(text.split()) < 80:
+        text = fallback_article_extraction(html)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text.split()) < 50:
+        raise RuntimeError("The page did not expose enough article text. It may require login, block automated access, or render its content only after browser interaction.")
+    return text[:MAX_ARTICLE_CHARS], method
+
+
+def summarize_article_batch(prompt: str, urls: list[str], model_key: str = DEFAULT_MODEL_KEY) -> tuple[str, str, list[dict[str, str]]]:
+    """Retrieve article pages directly and ask the selected local model for an English briefing."""
+    blocks: list[str] = []
+    sources: list[dict[str, str]] = []
+    for index, requested_url in enumerate(urls[:MAX_ARTICLE_URLS], 1):
+        log("Direct article retrieval started", url=requested_url)
+        html, final_url, _ = fetch_article_html(requested_url)
+        metadata = article_metadata_from_html(html, final_url)
+        text, method = extract_article_text(html, final_url)
+        blocks.append(
+            f"ARTICLE {index}\nTitle: {metadata['title']}\nURL: {final_url}\n"
+            f"Website: {metadata['domain']}\nAuthor: {metadata['author'] or 'Unknown'}\n"
+            f"Published: {metadata['published_date'] or 'Unknown'}\nExtraction method: {method}\n\n"
+            f"ARTICLE BODY:\n{text}"
+        )
+        sources.append({"title": metadata["title"], "url": final_url})
+        log("Direct article retrieval complete", url=final_url, words=len(text.split()), method=method)
+    exact_urls_only = bool(re.fullmatch(r"(?:\s*https?://\S+\s*)+", prompt or "", flags=re.I))
+    system = (
+        "You are an expert executive analyst. Use only the supplied article body text. The page chrome, advertising, "
+        "navigation and unrelated recommendations have been removed as far as possible. Always write the final response "
+        "in English, regardless of the source language. Do not claim the article is English and do not mention translation "
+        "unless language itself is relevant. Preserve important names, figures, dates, qualifications and disagreements. "
+        "Do not invent missing facts. If several articles are supplied, compare and synthesize them.\n\n" + COMMUNICATION_STYLE
+    )
+    default_instruction = (
+        "Use exactly these sections: Executive Summary, Key Points, Conclusions. The executive summary should be "
+        "decision-useful and concise. The key points should be detailed, non-repetitive bullets. The conclusion should "
+        "state the principal implications and any important limitations."
+    )
+    user_instruction = default_instruction if exact_urls_only else prompt
+    user = f"ORIGINAL USER REQUEST:\n{user_instruction}\n\n" + "\n\n---\n\n".join(blocks)
+    selected_key = normalize_model_key(model_key)
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    output = generate_with_model(
+        selected_key, messages,
+        max_tokens=MODEL_OPTIONS[selected_key]["max_tokens"],
+        enable_thinking=False if selected_key in {"default", "gemma"} else None,
+    )
+    reasoning, final_output = strip_think_block(output)
+    if selected_key in {"summary", "quick"} or final_answer_missing(final_output):
+        if not reasoning and final_output and selected_key in {"summary", "quick"}:
+            reasoning = final_output
+        retry = generate_final_only(selected_key, messages, reasoning)
+        leaked, final_output = strip_think_block(retry)
+        if leaked:
+            reasoning = "\n\n".join(part for part in (reasoning, leaked) if part)
+    if final_answer_missing(final_output):
+        raise RuntimeError("The selected model did not produce an article summary.")
+    return clean_inline_citations(final_output), reasoning, sources
 
 # -----------------------------------------------------------------------------
 # YouTube
@@ -2070,6 +2391,52 @@ def youtube_metadata_route():
         log("YouTube metadata failed", error=repr(exc))
         return jsonify(error=str(exc)), 500
 
+@app.post("/api/media_upload")
+def media_upload():
+    session_id = request.form.get("session_id") or str(uuid.uuid4())
+    incoming = request.files.get("file")
+    if incoming is None or not incoming.filename:
+        return jsonify(error="Choose an audio or video file."), 400
+    name = secure_filename(incoming.filename)
+    extension = Path(name).suffix.lower()
+    if extension not in MEDIA_EXTENSIONS:
+        return jsonify(error=f"Unsupported audio or video type: {extension or 'unknown'}"), 400
+    folder = MEDIA / secure_filename(session_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    for old in folder.iterdir():
+        if old.is_file():
+            old.unlink(missing_ok=True)
+        elif old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+    destination = folder / name
+    try:
+        incoming.save(destination)
+        if destination.stat().st_size > MAX_MEDIA_BYTES:
+            raise ValueError(f"Media files are limited to {MAX_MEDIA_BYTES // (1024 * 1024)} MB.")
+        metadata = probe_media(destination)
+        media = {
+            "session_id": session_id, "name": name, "path": str(destination),
+            "duration_seconds": metadata["duration_seconds"], "bytes": destination.stat().st_size,
+        }
+        get_session(session_id)["media"] = media
+        log("Local media uploaded", name=name, duration_seconds=media["duration_seconds"], bytes=media["bytes"])
+        return jsonify(session_id=session_id, media={k: v for k, v in media.items() if k != "path"})
+    except Exception as exc:
+        destination.unlink(missing_ok=True)
+        log("Local media upload failed", name=name, error=repr(exc))
+        return jsonify(error=str(exc)), 400
+
+@app.post("/api/media_remove")
+def media_remove():
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get("session_id") or "")
+    current_session = get_session(session_id) if session_id else None
+    if current_session is not None:
+        current_session["media"] = None
+    if session_id:
+        shutil.rmtree(MEDIA / secure_filename(session_id), ignore_errors=True)
+    return jsonify(ok=True)
+
 @app.post("/api/chat")
 def chat():
     data = request.get_json(force=True)
@@ -2113,8 +2480,25 @@ def chat():
         response_type = "standard"
         reasoning = ""
         youtube_urls = extract_youtube_urls(prompt)
+        article_urls = extract_article_urls(prompt)
         youtube_segments = data.get("youtube_segments") or []
-        if youtube_urls:
+        media_segment = data.get("media_segment")
+        uploaded_media = current_session.get("media")
+        if media_segment and uploaded_media:
+            response_type = "media_analysis"
+            output, reasoning, sources = analyze_local_media(prompt, uploaded_media, media_segment, model_key)
+            current_session["history"].extend(
+                [{"role": "user", "content": prompt}, {"role": "assistant", "content": output}]
+            )
+            current_session["history"] = current_session["history"][-MAX_HISTORY_TURNS * 2 :]
+        elif article_urls:
+            response_type = "article_summary"
+            output, reasoning, sources = summarize_article_batch(prompt, article_urls, model_key)
+            current_session["history"].extend(
+                [{"role": "user", "content": prompt}, {"role": "assistant", "content": output}]
+            )
+            current_session["history"] = current_session["history"][-MAX_HISTORY_TURNS * 2 :]
+        elif youtube_urls:
             if not youtube_segments:
                 youtube_segments = []
                 for url in youtube_urls:
@@ -2303,6 +2687,7 @@ def reset():
         sessions.pop(session_id, None)
     if session_id:
         shutil.rmtree(UPLOADS / secure_filename(session_id), ignore_errors=True)
+        shutil.rmtree(MEDIA / secure_filename(session_id), ignore_errors=True)
     clean_audio(0)
     log("Session reset", session_id=session_id)
     return jsonify(ok=True)
@@ -2344,7 +2729,7 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
 <button id="themeToggle" class="theme-toggle" type="button" aria-label="Switch to dark mode" title="Switch to dark mode">Dark</button>
 <div id="systemHealth" class="system-health" role="status" aria-live="polite" title="System-wide physical memory; updates every 10 seconds"><span class="health-label">Memory</span><span id="memorySummary" class="health-value">checking...</span></div>
 <h1>Steve's AI Tool</h1>
-<div class="sub">Local reasoning, web retrieval, YouTube summaries, local files, live mode, and multilingual voice interaction.</div>
+<div class="sub">Local reasoning, direct article reading, web retrieval, YouTube and uploaded-media transcription, local files, live mode, and multilingual voice interaction.</div>
 <section class="search-panel">
 <h2>Exa Search</h2>
 <div class="sub">Run as many searches as needed. Results accumulate below, and every selected article is available to the model for analysis.</div>
@@ -2365,7 +2750,7 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
 <div class="search-actions"><button class="primary" id="runSearch">Search</button><label><input type="checkbox" id="searchHighlights" checked> Retrieve highlights</label><label class="checkbox-line" id="selectAllResultsWrap" hidden><input type="checkbox" id="selectAllResults" checked><span>Select all results</span></label><span class="status" id="searchStatus">No search run.</span></div>
 <div class="search-results" id="searchResults"></div>
 </section>
-<textarea id="prompt" placeholder="Ask the model to analyse the retrieved search results, attached files, or another topic..."></textarea>
+<textarea id="prompt" placeholder="Paste an article URL for an English summary, or ask the model to analyse search results, attached files, or another topic..."></textarea>
 <div class="model-choice"><label for="modelSelect">Model for this prompt</label><select id="modelSelect"><option value="default" selected>Default — Qwen3 14B</option><option value="reasoning">DeepSeek Logical Reasoning</option><option value="summary">Summarization — Qwen3.5 9B</option><option value="quick">Quick Summarization — Qwen3.5 4B</option><option value="gemma">Multimodal analysis &amp; reasoning — Gemma 4 12B</option></select></div>
 <div class="bar">
 <button class="primary" id="send">Run prompt</button>
@@ -2373,6 +2758,7 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
 <button id="micMute" disabled title="Mute or unmute the microphone during live mode">🔇 Mute mic</button>
 <label title="Suppress the completion beep"><input type="checkbox" id="silent"> Silent mode</label>
 <label class="upload" for="files">Attach up to 15 documents</label><input id="files" type="file" multiple>
+<label class="upload" for="mediaFile">Attach audio/video</label><input id="mediaFile" type="file" accept="audio/*,video/*,.mkv,.m4a,.opus,.flac">
 <button class="danger" id="reset">Reset</button><span class="status" id="status">Ready</span>
 </div>
 <div class="live-activity" id="liveActivity" aria-live="polite">
@@ -2381,6 +2767,7 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
   <div class="live-stage" id="liveStage"><span class="live-dot"></span><span id="liveStageText">Listening...</span></div>
 </div>
 <div class="files" id="fileList">No files attached.</div>
+<div class="files" id="mediaStatus">No audio or video attached.</div>
 <div class="audio"><label>Playback speed <select id="speed"><option value="0.75">0.75x</option><option value="1" selected>1.0x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2.0x</option></select></label><audio id="player" controls></audio></div>
 <div id="history"></div>
 <div id="youtubeModalBackdrop" class="youtube-modal-backdrop" hidden>
@@ -2392,9 +2779,18 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
     <div class="youtube-modal-actions"><button type="button" id="youtubeCancel">Cancel</button><button type="button" class="primary" id="youtubeContinue">Transcribe selected segments</button></div>
   </section>
 </div>
+<div id="mediaModalBackdrop" class="youtube-modal-backdrop" hidden>
+  <section class="youtube-modal" role="dialog" aria-modal="true" aria-labelledby="mediaModalTitle">
+    <h2 id="mediaModalTitle">Select audio or video transcription segment</h2>
+    <div class="sub">Choose the start and finish. The full duration is selected by default.</div>
+    <div id="mediaModalList" class="youtube-modal-list"></div>
+    <div id="mediaModalError" class="youtube-modal-error" aria-live="polite"></div>
+    <div class="youtube-modal-actions"><button type="button" id="mediaCancel">Cancel</button><button type="button" class="primary" id="mediaContinue">Transcribe selected segment</button></div>
+  </section>
+</div>
 </section></main>
 <script>
-let sid=crypto.randomUUID(),latest='',searchSuggestionGroups={};
+let sid=crypto.randomUUID(),latest='',searchSuggestionGroups={},uploadedMedia=null;
 const $=id=>document.getElementById(id);
 function formatMemory(bytes){
   const gib=Number(bytes)/(1024**3);
@@ -2567,7 +2963,7 @@ function parseYoutubeSections(answer){
 function youtubeSection(title,body){return `<section class="youtube-section"><div class="youtube-section-head"><div class="youtube-section-title">${esc(title)}</div><div class="youtube-section-tools"><select class="read-lang" aria-label="Read ${esc(title)} aloud language">${langOptions}</select><button onclick="readSection(this)">🔊 Read aloud</button></div></div><div class="youtube-section-body">${renderMarkdown(body)}</div></section>`}
 function addTurn(prompt,answer,sources,elapsed,responseType='standard',reasoning='',modelLabel=''){
   latest=answer;
-  const src=(sources||[]).map((s,i)=>`<div><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title||('Source '+(i+1)))}</a></div>`).join('');
+  const src=(sources||[]).map((s,i)=>s.url?`<div><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title||('Source '+(i+1)))}</a></div>`:`<div>${esc(s.title||('Source '+(i+1)))}</div>`).join('');
   const sections=responseType==='youtube_summary'?parseYoutubeSections(answer):null;
   const responseHtml=sections?`<div class="youtube-sections">${youtubeSection('Executive Summary',sections['Executive Summary'])}${youtubeSection('Key Points',sections['Key Points'])}${youtubeSection('Conclusion',sections['Conclusion'])}</div>`:`<div class="response-head"><div class="prompt">${esc(prompt)}</div><div class="response-tools"><select class="read-lang" aria-label="Read aloud language">${langOptions}</select><button onclick="readTurn(this)">🔊 Read aloud</button></div></div><div class="answer">${renderMarkdown(answer)}</div>`;
   const promptHtml=sections?`<div class="prompt">${esc(prompt)}</div>`:'';
@@ -2729,7 +3125,21 @@ function formatYoutubeTime(totalSeconds){const seconds=Math.max(0,Math.round(Num
 function extractYoutubeUrlsFromPrompt(text){const regex=/https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:[^\s#]*&)?v=|shorts\/|live\/|embed\/)|youtu\.be\/)[A-Za-z0-9_-]{11}[^\s<>'"]*/gi;const seen=new Set();return (String(text).match(regex)||[]).map(url=>url.replace(/[.,);\]}]+$/,'')).filter(url=>{const id=url.match(/(?:v=|youtu\.be\/|shorts\/|live\/|embed\/)([A-Za-z0-9_-]{11})/i)?.[1];if(!id||seen.has(id))return false;seen.add(id);return true})}
 function youtubeSegmentCard(video,index){return `<article class="youtube-segment-card" data-index="${index}" data-url="${esc(video.url)}" data-title="${esc(video.title)}" data-duration="${video.duration_seconds}"><div class="youtube-video-title">${esc(video.title)}</div><div class="youtube-video-url-row"><div class="youtube-video-url" title="${esc(video.url)}">${esc(video.url)}</div><button type="button" class="youtube-copy-url">Copy URL</button></div><div class="youtube-time-row"><div><div class="youtube-time-value start-label">00:00</div><input class="youtube-range youtube-start" type="range" min="0" max="${video.duration_seconds}" step="1" value="0" aria-label="Transcription start"></div><span>to</span><div><div class="youtube-time-value end-label">${formatYoutubeTime(video.duration_seconds)}</div><input class="youtube-range youtube-end" type="range" min="0" max="${video.duration_seconds}" step="1" value="${video.duration_seconds}" aria-label="Transcription finish"></div></div></article>`}
 async function chooseYoutubeSegments(prompt){const urls=extractYoutubeUrlsFromPrompt(prompt);if(!urls.length)return [];const response=await fetch('/api/youtube_metadata',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})});const data=await response.json();if(!response.ok)throw Error(data.error||'Could not read YouTube video details.');$('youtubeModalList').innerHTML=data.videos.map(youtubeSegmentCard).join('');$('youtubeModalError').textContent='';$('youtubeModalBackdrop').hidden=false;const cards=Array.from(document.querySelectorAll('.youtube-segment-card'));cards.forEach(card=>{const start=card.querySelector('.youtube-start'),end=card.querySelector('.youtube-end'),startLabel=card.querySelector('.start-label'),endLabel=card.querySelector('.end-label');const update=changed=>{let a=Number(start.value),b=Number(end.value);if(a>=b){if(changed===start)a=Math.max(0,b-1);else b=Math.min(Number(end.max),a+1);start.value=a;end.value=b}startLabel.textContent=formatYoutubeTime(a);endLabel.textContent=formatYoutubeTime(b)};start.oninput=()=>update(start);end.oninput=()=>update(end);card.querySelector('.youtube-copy-url').onclick=async event=>{await navigator.clipboard.writeText(card.dataset.url);const button=event.currentTarget,old=button.textContent;button.textContent='Copied';setTimeout(()=>button.textContent=old,1200)}});return await new Promise(resolve=>{$('youtubeCancel').onclick=()=>{$('youtubeModalBackdrop').hidden=true;resolve(null)};$('youtubeContinue').onclick=()=>{const segments=cards.map(card=>({url:card.dataset.url,title:card.dataset.title,duration_seconds:Number(card.dataset.duration),start_seconds:Number(card.querySelector('.youtube-start').value),end_seconds:Number(card.querySelector('.youtube-end').value)}));$('youtubeModalBackdrop').hidden=true;resolve(segments)}})}
-$('send').onclick=async()=>{const p=$('prompt').value.trim();if(!p)return;const started=performance.now();const youtubeUrls=extractYoutubeUrlsFromPrompt(p);let youtubeSegments=[];try{if(youtubeUrls.length){busy(true,'Loading YouTube video details...');youtubeSegments=await chooseYoutubeSegments(p);if(youtubeSegments===null){busy(false,'YouTube transcription cancelled.');return}}busy(true,youtubeUrls.length?`Transcribing ${youtubeUrls.length} selected video segment${youtubeUrls.length===1?'':'s'}...`:'Reasoning over the approved evidence...');const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,prompt:p,youtube_segments:youtubeSegments,use_search_results:true,selected_source_indices:selectedSearchResultIndices(),selected_source_urls:selectedSearchResultUrls(),max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})});const d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;const elapsed=Number(d.elapsed_seconds||((performance.now()-started)/1000));addTurn(p,d.answer,d.sources,elapsed,d.response_type||'standard',d.reasoning||'',d.model_label||'');$('prompt').value='';busy(false,`Complete in ${elapsed.toFixed(2)}s`);beep()}catch(e){$('youtubeModalBackdrop').hidden=true;busy(false,'Error: '+e.message)}};
+function localMediaSegmentCard(media){return `<article class="youtube-segment-card" data-duration="${media.duration_seconds}"><div class="youtube-video-title">${esc(media.name)}</div><div class="youtube-video-url">${(Number(media.bytes)/(1024*1024)).toFixed(1)} MB · ${formatYoutubeTime(media.duration_seconds)}</div><div class="youtube-time-row"><div><div class="youtube-time-value start-label">00:00</div><input class="youtube-range media-start" type="range" min="0" max="${media.duration_seconds}" step="1" value="0" aria-label="Transcription start"></div><span>to</span><div><div class="youtube-time-value end-label">${formatYoutubeTime(media.duration_seconds)}</div><input class="youtube-range media-end" type="range" min="0" max="${media.duration_seconds}" step="1" value="${media.duration_seconds}" aria-label="Transcription finish"></div></div></article>`}
+async function chooseLocalMediaSegment(){
+  if(!uploadedMedia)return null;
+  $('mediaModalList').innerHTML=localMediaSegmentCard(uploadedMedia);$('mediaModalError').textContent='';$('mediaModalBackdrop').hidden=false;
+  const card=$('mediaModalList').querySelector('.youtube-segment-card'),start=card.querySelector('.media-start'),end=card.querySelector('.media-end'),startLabel=card.querySelector('.start-label'),endLabel=card.querySelector('.end-label');
+  const update=changed=>{let a=Number(start.value),b=Number(end.value);if(a>=b){if(changed===start)a=Math.max(0,b-1);else b=Math.min(Number(end.max),a+1);start.value=a;end.value=b}startLabel.textContent=formatYoutubeTime(a);endLabel.textContent=formatYoutubeTime(b)};
+  start.oninput=()=>update(start);end.oninput=()=>update(end);
+  return await new Promise(resolve=>{$('mediaCancel').onclick=()=>{$('mediaModalBackdrop').hidden=true;resolve(null)};$('mediaContinue').onclick=()=>{$('mediaModalBackdrop').hidden=true;resolve({start_seconds:Number(start.value),end_seconds:Number(end.value)})}})
+}
+$('mediaFile').onchange=async()=>{
+  const file=$('mediaFile').files[0];if(!file)return;
+  const fd=new FormData();fd.append('session_id',sid);fd.append('file',file);busy(true,'Uploading and inspecting media...');
+  try{const r=await fetch('/api/media_upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;uploadedMedia=d.media;$('mediaStatus').textContent=`Attached media: ${d.media.name} · ${formatYoutubeTime(d.media.duration_seconds)} · ${(Number(d.media.bytes)/(1024*1024)).toFixed(1)} MB`;busy(false,'Media ready. Enter a prompt and run it.')}catch(e){uploadedMedia=null;$('mediaStatus').textContent='Media error: '+e.message;busy(false,'Error: '+e.message)}finally{$('mediaFile').value=''}
+};
+$('send').onclick=async()=>{const p=$('prompt').value.trim();if(!p)return;const started=performance.now();const youtubeUrls=extractYoutubeUrlsFromPrompt(p);let youtubeSegments=[],mediaSegment=null;try{if(uploadedMedia&&!youtubeUrls.length){busy(true,'Choose the audio or video segment to transcribe...');mediaSegment=await chooseLocalMediaSegment();if(mediaSegment===null){busy(false,'Media transcription cancelled.');return}}else if(youtubeUrls.length){busy(true,'Loading YouTube video details...');youtubeSegments=await chooseYoutubeSegments(p);if(youtubeSegments===null){busy(false,'YouTube transcription cancelled.');return}}const mediaWork=Boolean(mediaSegment);busy(true,mediaWork?'Transcribing the selected audio or video segment...':youtubeUrls.length?`Transcribing ${youtubeUrls.length} selected video segment${youtubeUrls.length===1?'':'s'}...`:'Reasoning over the approved evidence...');const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,prompt:p,youtube_segments:youtubeSegments,media_segment:mediaSegment,use_search_results:true,selected_source_indices:selectedSearchResultIndices(),selected_source_urls:selectedSearchResultUrls(),max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})});const d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;const elapsed=Number(d.elapsed_seconds||((performance.now()-started)/1000));addTurn(p,d.answer,d.sources,elapsed,d.response_type||'standard',d.reasoning||'',d.model_label||'');$('prompt').value='';busy(false,`Complete in ${elapsed.toFixed(2)}s`);beep()}catch(e){$('youtubeModalBackdrop').hidden=true;$('mediaModalBackdrop').hidden=true;busy(false,'Error: '+e.message)}};
 $('prompt').onkeydown=e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')$('send').click()};
 $('files').onchange=async()=>{const selectedFiles=Array.from($('files').files);if(selectedFiles.length>15){$('status').textContent='Select no more than 15 documents at once.';$('files').value='';return}const fd=new FormData();fd.append('session_id',sid);for(const file of selectedFiles)fd.append('files',file);busy(true,'Reading files...');try{const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;$('fileList').textContent=(d.added.length?'Attached: '+d.added.map(x=>`${x.name} (${x.characters.toLocaleString()} chars)`).join(', '):'No files attached.')+(d.errors.length?' Errors: '+d.errors.map(x=>x.name+': '+x.error).join('; '):'');busy(false,'Files ready')}catch(e){busy(false,'Error: '+e.message)}finally{$('files').value=''}};
 $('speed').onchange=()=>$('player').playbackRate=Number($('speed').value);
@@ -2737,7 +3147,7 @@ $('maxArticles').oninput=()=>{$('maxArticlesValue').textContent=String(Number($(
 $('micMute').onclick=async()=>{try{await setMicMuted(!$('micMute').textContent.includes('Unmute'))}catch(e){$('status').textContent='Mic mute error: '+e.message}};
 $('live').onclick=async()=>{$('live').disabled=true;$('status').textContent=$('live').textContent.includes('Stop')?'Stopping live mode...':'Starting microphone...';try{const r=await fetch('/api/live_toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,use_search_results:true,max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;$('live').textContent=d.active?'⏹ Stop live mode':'🎙 Start live mode';$('micMute').disabled=!d.active;$('micMute').textContent=d.muted?'🎤 Unmute mic':'🔇 Mute mic';$('status').textContent=d.active?(d.muted?'Live mode active — microphone muted':'Listening for a spoken prompt...'):'Live mode stopped';if(d.active)showLiveActivity(null,d.muted?'Microphone muted.':'Listening for a spoken prompt...',true);else showLiveActivity(null,'Live mode stopped.',false)}catch(e){$('status').textContent='Live error: '+e.message}finally{$('live').disabled=false}};
 setInterval(async()=>{try{const r=await fetch('/api/live_poll'),d=await r.json();$('live').textContent=d.active?'⏹ Stop live mode':'🎙 Start live mode';$('micMute').disabled=!d.active;$('micMute').textContent=d.muted?'🎤 Unmute mic':'🔇 Mute mic';for(const item of d.items){const type=item.type||('answer'in item?'result':('error'in item?'error':'status'));if(type==='transcript'){showLiveActivity(item.prompt,item.message||'Message received. Preparing your response...',true);continue}if(type==='status'){showLiveActivity(null,item.message||'Working...',true);continue}if(type==='error'){showLiveActivity(null,item.message||('Live error: '+item.error),false);$('status').textContent='Live error: '+item.error;continue}if(type==='result'){showLiveActivity(item.prompt,item.message||'Response ready.',false);addTurn(item.prompt,item.answer,item.sources,item.elapsed_seconds,'standard',item.reasoning||'',item.model_key||'');busy(false,`Live response complete in ${Number(item.elapsed_seconds).toFixed(2)}s`);beep()}}}catch(e){}},500);
-$('reset').onclick=async()=>{await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid})});sid=crypto.randomUUID();latest='';$('prompt').value='';$('searchQuery').value='';$('searchObjective').value='';$('includeDomains').value='';$('excludeDomains').value='';$('searchType').value='auto';$('userLocation').value='';$('contentModeration').checked=false;$('collapseHighlights').checked=true;setSearchLanguages(['en']);$('languagePicker').open=false;Array.from($('searchCategories').options).forEach(option=>option.selected=false);$('freshnessMode').value='cached';updateFreshnessFields();$('searchResults').innerHTML='';searchSuggestionGroups={};$('selectAllResultsWrap').hidden=true;$('selectAllResults').checked=true;$('selectAllResults').indeterminate=false;$('searchStatus').textContent='No search run.';$('searchStatus').dataset.summary='';$('searchStatus').dataset.selection='';$('history').innerHTML='';$('fileList').textContent='No files attached.';$('player').pause();$('player').removeAttribute('src');$('player').load();$('live').textContent='🎙 Start live mode';$('micMute').disabled=true;$('micMute').textContent='🔇 Mute mic';resetLiveActivity();$('status').textContent='Reset complete'};
+$('reset').onclick=async()=>{await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid})});sid=crypto.randomUUID();latest='';$('prompt').value='';$('searchQuery').value='';$('searchObjective').value='';$('includeDomains').value='';$('excludeDomains').value='';$('searchType').value='auto';$('userLocation').value='';$('contentModeration').checked=false;$('collapseHighlights').checked=true;setSearchLanguages(['en']);$('languagePicker').open=false;Array.from($('searchCategories').options).forEach(option=>option.selected=false);$('freshnessMode').value='cached';updateFreshnessFields();$('searchResults').innerHTML='';searchSuggestionGroups={};$('selectAllResultsWrap').hidden=true;$('selectAllResults').checked=true;$('selectAllResults').indeterminate=false;$('searchStatus').textContent='No search run.';$('searchStatus').dataset.summary='';$('searchStatus').dataset.selection='';$('history').innerHTML='';$('fileList').textContent='No files attached.';uploadedMedia=null;$('mediaStatus').textContent='No audio or video attached.';$('player').pause();$('player').removeAttribute('src');$('player').load();$('live').textContent='🎙 Start live mode';$('micMute').disabled=true;$('micMute').textContent='🔇 Mute mic';resetLiveActivity();$('status').textContent='Reset complete'};
 </script>
 </body></html>'''
 
