@@ -1,6 +1,6 @@
 # Steve's AI Tool
 
-A local-first research and analysis application for Apple Silicon Macs. It combines local MLX language models, Exa web search, document analysis, multimedia audio analysis, webpage analysis, YouTube summarization, live voice input, multilingual read-aloud, and a browser-based interface in a single Python application.
+A local-first research and analysis application for Apple Silicon Macs. It combines local MLX language models, Exa web search, document analysis, multimedia audio analysis, image and video analysis, webpage analysis, YouTube summarization, live voice input, multilingual read-aloud, and a browser-based interface in a single Python application.
 
 The application is designed for research workflows where you want local model inference and direct control over the evidence supplied to the model, while retaining the option to retrieve current web content through Exa.
 
@@ -30,8 +30,9 @@ The application is designed for research workflows where you want local model in
 - **Voice control** - Live AI chat mode, with a mic mute button.
 
 **Reasoning:**
-- **Bulk document analysis** - Upload up to 15 documents at a time. Copilot limits you to 3.
-- **Multimedia analysis** - Extract the audio from any video or audio file, and reason upon it.
+- **Bulk document analysis** - Upload up to 15 documents at a time. Copilot limits you to two.
+- **Multimedia audio analysis** - Extract the audio from any video or audio file, and reason upon it.
+- **Image and video analysis** - Examine any image or view file, and reason upon it with two different models.
 - **Webpage analysis** - Specify the URL to any article in any language, and reason upon it.
 - **Model selection** - Choice of models from Google, Qwen, Deepseek depending on the chosen task - whether it be fast summarization or slow deep reasoning.
 - **Switch models** - Switch between models during the chat.
@@ -119,12 +120,13 @@ The application is designed for research workflows where you want local model in
 Choose a model for each prompt:
 
 - **Qwen3 14B 4-bit (DEFAULT)** — general-purpose research, analysis, synthesis, writing, and multilingual tasks. Supports **32,768 tokens natively**, extendable to **131,072 tokens with YaRN**, with switchable thinking and non-thinking modes.
-- **DeepSeek-R1 Distill Qwen 14B 4-bit** — deliberate reasoning, complex problem-solving, mathematics, coding, and tasks that benefit from self-verification. Supports a context window of approximately **128K tokens**, but is generally slower and more verbose than Qwen3.
-- **Qwen3.5 9B 4-bit** — long-document summarization, research synthesis, visual-document analysis, and reasoning where a balance of quality, speed, and memory use is required. Supports **262,144 tokens natively**, extendable to approximately **1 million tokens**, with text and image input.
-- **Qwen3.5 4B 4-bit** — fast, memory-efficient summarization, extraction, classification, and routine document processing. Supports **262,144 tokens natively**, extendable to approximately **1 million tokens**, with text and image input, although practical context may be constrained by available unified memory.
-- **Gemma 4 12B 4-bit** — multimodal analysis and reasoning across text, images, audio, and video through **MLX-VLM**. Supports a context window of up to **256K tokens** and configurable thinking modes, making it the preferred option when the input is not limited to text.
+- **DeepSeek-R1 Distill Qwen 14B 4-bit** — optimized for deliberate reasoning, complex problem-solving, mathematics, coding, and tasks that benefit from self-verification. Supports approximately **128K tokens**, but is generally slower and more verbose than Qwen3.
+- **Qwen3.5 9B 4-bit** — suited to long-document summarization, research synthesis, visual-document analysis, and tasks requiring a strong balance of quality, speed, and memory use. Supports **262,144 tokens natively**, extendable to approximately **1 million tokens**, with text and image input.
+- **Qwen3.5 4B 4-bit** — the fastest and most memory-efficient option for summarization, extraction, classification, and routine document processing. Supports **262,144 tokens natively**, extendable to approximately **1 million tokens**, with text and image input. In practice, the usable context length depends on available unified memory.
+- **Qwen3-VL 8B Instruct 4-bit** — the preferred model for screenshots, OCR, financial tables, charts, scanned documents, visual interfaces, and other image-intensive analysis. Supports a native context window of **256K tokens**, extendable to approximately **1 million tokens**, with strong visual grounding, spatial understanding, and multilingual OCR.
+- **Gemma 4 12B 4-bit** — designed for broader multimodal analysis and reasoning across text, images, audio, and video through **MLX-VLM**. Supports a context window of up to **256K tokens** and configurable thinking modes. Use it for multimodal reasoning that extends beyond screenshots and visual-document extraction.
 
-Only one large model is retained in memory at a time. When you switch models, the application releases the previous model and clears the MLX cache before loading the next one.
+Only one large model is retained in memory at a time. Model selection applies to the current prompt only. When switching models, the application releases the previous model and clears the MLX cache before loading the next one. The selected model receives up to the 12 most recent user-assistant exchanges from the shared session history. For standard chat prompts, it also receives the currently selected search results and attached files or images. Direct article, YouTube, and uploaded-media analyses use task-specific contexts instead, although their completed outputs are added to the shared conversation history for subsequent standard prompts.
 
 **Why this is useful:**
 
@@ -132,6 +134,7 @@ Only one large model is retained in memory at a time. When you switch models, th
 - Different models can be selected according to speed, context size, and reasoning needs.
 - Single-model memory management reduces the risk of exhausting unified memory when switching between models.
 - Reasoning output is separated from the final response and displayed in a collapsible section when available.
+- Ability to feed previous responses and search results processed with other models to a new model for enhancing and refining the analysis.
 
 ### Exa web research
 
@@ -157,7 +160,7 @@ The integrated Exa search interface supports:
 
 - Research can be built in stages instead of replacing earlier results with every search.
 - You decide exactly which sources are passed to the model.
-- The model analyses the selected evidence rather than treating retrieval output as the final answer.
+- The model analyzes the selected evidence rather than treating retrieval output as the final answer.
 - Language, domain, category, location, and timeframe controls make searches more targeted.
 - Follow-up suggestions help expose missing evidence, weak coverage, or contradictory sources.
 
@@ -166,6 +169,18 @@ The integrated Exa search interface supports:
 ### Webpage analysis
 
 Paste the article to any URL and the selected LLM will examine it and respond to your prompt.
+
+**Why this is useful:**
+
+- Analyze and reason upon webpages, which is a feature that commercial tools might refuse to offer.
+
+### Local multimedia analysis
+
+Attach a image or video file and reason upon it with Gemma or Qwen 3 VL.
+
+**Why this is useful:**
+
+- Analyze and reason upon multimedia.
 
 ### Local multimedia analysis
 
@@ -191,7 +206,7 @@ Text is extracted locally and added to the active research session. PDF, Word, a
 
 **Why this is useful:**
 
-- Internal documents can be analysed alongside selected web evidence.
+- Internal documents can be analyzed alongside selected web evidence.
 - Multiple files can be compared in one prompt.
 - The application does not require documents to be sent to a hosted LLM provider.
 
@@ -392,7 +407,8 @@ python -m pip install \
   nltk \
   trafilatura \
   beautifulsoup4 \
-  lxml
+  lxml \
+  Pillow
 ```
 
 Install NeMo Text Processing without dependency resolution, then install the additional libraries it requires:
@@ -503,7 +519,7 @@ If access was denied:
 2. Enter a short prompt and select **Run prompt**.
 3. Attach a small text or PDF file and ask for a structured summary.
 4. Add `EXA_API_KEY`, run an eight-result English search, and inspect the retrieved highlights.
-5. Deselect one or more results and ask the model to analyse only the selected evidence.
+5. Deselect one or more results and ask the model to analyze only the selected evidence.
 6. Test larger models after confirming that the basic workflow is stable.
 
 ## Configuration
@@ -554,17 +570,18 @@ python app.py
 
 | Key | Model | Backend | Typical role |
 |---|---|---|---|
-| `default` | `mlx-community/Qwen3-14B-4bit` | MLX-LM | General research and synthesis |
-| `reasoning` | `mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit` | MLX-LM | Deliberate reasoning |
-| `summary` | `mlx-community/Qwen3.5-9B-MLX-4bit` | MLX-VLM | Long-context summarization |
-| `quick` | `mlx-community/Qwen3.5-4B-MLX-4bit` | MLX-VLM | Faster, lower-memory summarization |
-| `gemma` | `mlx-community/gemma-4-12B-it-4bit` | MLX-VLM | Multimodal-capable analysis and reasoning |
+| `default` | `mlx-community/Qwen3-14B-4bit` | MLX-LM | General research, analysis, writing, and synthesis |
+| `reasoning` | `mlx-community/DeepSeek-R1-Distill-Qwen-14B-4bit` | MLX-LM | Deliberate reasoning and complex problem-solving |
+| `summary` | `mlx-community/Qwen3.5-9B-MLX-4bit` | MLX-VLM | Long-context summarization and visual-document analysis |
+| `quick` | `mlx-community/Qwen3.5-4B-MLX-4bit` | MLX-VLM | Faster, lower-memory summarization and extraction |
+| `gemma` | `mlx-community/gemma-4-12B-it-4bit` | MLX-VLM | Broad multimodal analysis across text, images, audio, and video |
+| `qwen3_vl` | `mlx-community/Qwen3-VL-8B-Instruct-4bit` | MLX-VLM | Screenshots, OCR, financial tables, charts, and visual-document analysis |
 
 Model identifiers, repositories, and compatibility can change. If a configured model is unavailable, update the corresponding entry in `MODEL_OPTIONS` in `app.py` to a compatible MLX repository.
 
 ## Using the application
 
-### A. Search first, then analyse
+### A. Search first, then analyze
 
 1. Enter a search query.
 2. Optionally define a search objective.
@@ -580,7 +597,7 @@ All selected results from all accumulated search batches are available to the mo
 
 Run several related searches. Each new batch is appended to the existing session, while duplicate URLs are skipped. After each batch, use **Suggest follow up searches** to identify complementary research angles. Select the articles that should form the final evidence set, then ask the model to compare or synthesize them.
 
-### C. Analyse local documents
+### C. Analyze local documents
 
 Select **Attach up to 15 documents**, choose the files, and wait for extraction to complete. Then ask the model to summarize, compare, challenge, or combine the uploaded material. Files remain attached until the session is reset.
 
@@ -615,7 +632,7 @@ For confidential or regulated use, review the code, dependency supply chain, dat
 
 ## Important limitations
 
-- This is a local development application, not a hardened multi-user service.
+- This is a local development application intended for private use, not a hardened multi-user service.
 - In-memory sessions are lost when the process stops.
 - There is no user authentication or authorization.
 - Uploaded filenames are sanitized, but uploaded content should still be treated as untrusted input.
@@ -735,4 +752,4 @@ Published under the MIT license.
 
 ## Acknowledgements
 
-This project integrates Flask, MLX, MLX-LM, MLX-VLM, MLX Whisper, Exa, the YouTube Transcript API, yt-dlp, Piper, NeMo Text Processing, Argos Translate, and supporting Python libraries.
+This project integrates Flask, MLX, MLX-LM, MLX-VLM, MLX Whisper, Exa, the YouTube Transcript API, yt-dlp, Piper, NeMo Text Processing, Argos Translate, Pillow, and supporting Python libraries.

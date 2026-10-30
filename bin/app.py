@@ -85,6 +85,12 @@ MODEL_OPTIONS = {
         "backend": "mlx_vlm",
         "max_tokens": 4000,
     },
+    "qwen3_vl": {
+        "label": "Qwen3-VL 8B — Screenshots, OCR, charts & document analysis",
+        "model": "mlx-community/Qwen3-VL-8B-Instruct-4bit",
+        "backend": "mlx_vlm",
+        "max_tokens": 4000,
+    },
 }
 
 COMMUNICATION_STYLE = """
@@ -126,6 +132,9 @@ ALLOWED_EXTENSIONS = {
     ".txt", ".md", ".csv", ".json", ".py", ".log",
     ".html", ".xml", ".pdf", ".docx", ".xlsx",
 }
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(40 * 1024 * 1024)))
+MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "80000000"))
 MEDIA_EXTENSIONS = {
     ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif",
     ".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".wmv", ".mpeg", ".mpg",
@@ -263,7 +272,7 @@ def log(event: str, **fields: Any) -> None:
 
 def get_session(session_id: str) -> dict[str, Any]:
     with sessions_lock:
-        return sessions.setdefault(session_id, {"history": [], "files": [], "search": None, "media": None})
+        return sessions.setdefault(session_id, {"history": [], "files": [], "images": [], "search": None, "media": None})
 
 
 def normalize_model_key(model_key: str | None) -> str:
@@ -314,8 +323,14 @@ def local_model(model_key: str | None = None):
                         "python -m pip install -U mlx-vlm"
                     ) from exc
                 model, processor = vlm_load(selected["model"])
+                try:
+                    from mlx_vlm.utils import load_config as vlm_load_config
+                    vlm_config = vlm_load_config(selected["model"])
+                except Exception as exc:
+                    vlm_config = getattr(model, "config", None)
+                    log("MLX-VLM config fallback", model=selected["model"], error=repr(exc))
                 _model_cache[selected_key] = {
-                    "backend": backend, "model": model, "processor": processor,
+                    "backend": backend, "model": model, "processor": processor, "config": vlm_config,
                 }
             else:
                 from mlx_lm import load as lm_load
@@ -368,64 +383,56 @@ def generate_with_model(
     messages: list[dict[str, str]],
     max_tokens: int | None = None,
     enable_thinking: bool | None = None,
+    image_paths: list[str] | None = None,
 ) -> str:
     selected_key = normalize_model_key(model_key)
     selected = MODEL_OPTIONS[selected_key]
     loaded = local_model(selected_key)
     token_limit = max_tokens or selected["max_tokens"]
-    prompt = apply_model_chat_template(loaded, messages, enable_thinking=enable_thinking)
+    valid_images = [str(Path(item)) for item in (image_paths or []) if Path(item).is_file()]
 
     if loaded["backend"] == "mlx_vlm":
         from mlx_vlm import generate as vlm_generate
-
-        kwargs = {
-            "prompt": prompt,
-            "max_tokens": token_limit,
-            "verbose": False,
-        }
+        if valid_images:
+            from mlx_vlm.prompt_utils import apply_chat_template as apply_vlm_chat_template
+            conversation = "\n\n".join(
+                f"{str(item.get('role') or 'user').upper()}: {str(item.get('content') or '')}"
+                for item in messages
+            )
+            vlm_config = loaded.get("config")
+            if vlm_config is None:
+                raise RuntimeError("Could not load the MLX-VLM configuration required for image encoding. Upgrade mlx-vlm and restart.")
+            prompt = apply_vlm_chat_template(
+                loaded["processor"], vlm_config, conversation, num_images=len(valid_images)
+            )
+            log("MLX-VLM visual prompt prepared", model_key=selected_key,
+                image_count=len(valid_images), prompt_characters=len(prompt))
+        else:
+            prompt = apply_model_chat_template(loaded, messages, enable_thinking=enable_thinking)
+        image_input: Any = valid_images[0] if len(valid_images) == 1 else (valid_images or None)
         started = time.perf_counter()
         with model_lock:
             try:
-                result = vlm_generate(
-                    loaded["model"],
-                    loaded["processor"],
-                    **kwargs,
-                )
-            except TypeError:
-                # Compatibility with mlx-vlm versions that require an explicit
-                # empty image collection for text-only generation.
-                result = vlm_generate(
-                    loaded["model"],
-                    loaded["processor"],
-                    image=None,
-                    **kwargs,
-                )
+                result = vlm_generate(loaded["model"], loaded["processor"],
+                    prompt=prompt, image=image_input, max_tokens=token_limit, verbose=False)
+            except TypeError as exc:
+                if image_input is not None:
+                    raise RuntimeError("The installed mlx-vlm version cannot pass images. Run: python -m pip install -U mlx-vlm") from exc
+                result = vlm_generate(loaded["model"], loaded["processor"],
+                    prompt=prompt, max_tokens=token_limit, verbose=False)
         output = result.text if hasattr(result, "text") else str(result)
-        log(
-            "MLX generation complete",
-            model_key=selected_key,
-            backend="mlx_vlm",
-            elapsed_seconds=round(time.perf_counter() - started, 2),
-        )
+        log("MLX generation complete", model_key=selected_key, backend="mlx_vlm",
+            image_count=len(valid_images), elapsed_seconds=round(time.perf_counter()-started, 2))
         return output.strip()
 
+    prompt = apply_model_chat_template(loaded, messages, enable_thinking=enable_thinking)
     from mlx_lm import generate as lm_generate
-
     started = time.perf_counter()
     with model_lock:
-        output = lm_generate(
-            loaded["model"],
-            loaded["tokenizer"],
-            prompt=prompt,
-            max_tokens=token_limit,
-            verbose=False,
-        ).strip()
-    log(
-        "MLX generation complete",
-        model_key=selected_key,
-        backend="mlx_lm",
-        elapsed_seconds=round(time.perf_counter() - started, 2),
-    )
+        output = lm_generate(loaded["model"], loaded["tokenizer"], prompt=prompt,
+            max_tokens=token_limit, verbose=False).strip()
+    log("MLX generation complete", model_key=selected_key, backend="mlx_lm",
+        elapsed_seconds=round(time.perf_counter()-started, 2))
     return output
 
 
@@ -537,6 +544,7 @@ def generate_final_only(
     model_key: str,
     original_messages: list[dict[str, str]],
     reasoning: str = "",
+    image_paths: list[str] | None = None,
 ) -> str:
     """Generate the visible answer using the selected model with thinking disabled."""
     final_messages = list(original_messages)
@@ -554,12 +562,31 @@ def generate_final_only(
         final_messages,
         max_tokens=MODEL_OPTIONS[model_key]["max_tokens"],
         enable_thinking=False,
+        image_paths=image_paths,
     )
 
 
 # -----------------------------------------------------------------------------
 # Attachments
 # -----------------------------------------------------------------------------
+def validate_image(path: Path) -> dict[str, Any]:
+    """Verify an uploaded image and return safe metadata for the UI/model."""
+    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+        raise ValueError(f"Unsupported image type: {path.suffix.lower() or 'unknown'}")
+    if path.stat().st_size > MAX_IMAGE_BYTES:
+        raise ValueError(f"Images are limited to {MAX_IMAGE_BYTES // (1024 * 1024)} MB each.")
+    from PIL import Image
+    with Image.open(path) as image:
+        image.verify()
+    with Image.open(path) as image:
+        width, height = image.size
+        frames = int(getattr(image, "n_frames", 1) or 1)
+        image_format = str(image.format or path.suffix.lstrip(".")).upper()
+    if width < 1 or height < 1 or width * height > MAX_IMAGE_PIXELS:
+        raise ValueError("The image dimensions are invalid or exceed the configured pixel limit.")
+    return {"width": width, "height": height, "frames": frames, "format": image_format}
+
+
 def extract_text(path: Path) -> str:
     extension = path.suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
@@ -660,7 +687,7 @@ def analyze_local_media(
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         output = generate_with_model(
             selected_key, messages, max_tokens=MODEL_OPTIONS[selected_key]["max_tokens"],
-            enable_thinking=False if selected_key in {"default", "gemma"} else None,
+            enable_thinking=False if selected_key in {"default", "gemma", "qwen3_vl"} else None,
         )
         reasoning, final_output = strip_think_block(output)
         if selected_key in {"summary", "quick"} or final_answer_missing(final_output):
@@ -1114,7 +1141,22 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
     file_context = "\n\n".join(
         f"LOCAL FILE: {item['name']}\n{item['text']}" for item in current_session["files"]
     )
-    evidence = "\n\n".join(part for part in (file_context, web_context) if part)
+    attached_images = [item for item in current_session.get("images", []) if Path(str(item.get("path") or "")).is_file()]
+    image_paths = [str(item["path"]) for item in attached_images]
+    if image_paths:
+        log("Images selected for analysis", model_key=model_key, image_names=[item["name"] for item in attached_images])
+    if image_paths and MODEL_OPTIONS[model_key]["backend"] != "mlx_vlm":
+        raise ValueError(
+            f"{MODEL_OPTIONS[model_key]['label']} is text-only and cannot analyse images. "
+            "Select Qwen3-VL 8B, Gemma 4 12B, or another multimodal model."
+        )
+    image_context = ""
+    if attached_images:
+        image_context = "ATTACHED IMAGES AVAILABLE TO THE MODEL:\n" + "\n".join(
+            f"- {item['name']} ({item['width']}x{item['height']}, {item['format']})"
+            for item in attached_images
+        )
+    evidence = "\n\n".join(part for part in (file_context, image_context, web_context) if part)
 
     system = (
         "You are a rigorous local research assistant. You, not the retrieval service, write the final response. "
@@ -1122,6 +1164,9 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
         "Do not reproduce retrieval output verbatim. Distinguish established evidence from inference and mention genuine uncertainty. "
         "Do not include bracketed reference markers, numbered citations, source IDs, or forms such as [1], [2], [Source 1], or [WEB SOURCE]. "
         "Do not append a references or sources section because the interface displays source links separately. "
+        "When images are attached, base the answer on the pixels in those images. First identify the visible document or scene, then extract only legible facts relevant to the request. "
+        "Do not substitute a remembered or unrelated image. If the image is unavailable, unreadable, or inconsistent with the question, say so explicitly rather than guessing. "
+        "State uncertainty where image detail is unreadable or ambiguous. "
         "Use ordinary prose, headings, and bullets where useful.\n\n"
         + COMMUNICATION_STYLE
     )
@@ -1144,7 +1189,8 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
         model_key,
         messages,
         max_tokens=MODEL_OPTIONS[model_key]["max_tokens"],
-        enable_thinking=False if model_key in {"default", "gemma"} else None,
+        enable_thinking=False if model_key in {"default", "gemma", "qwen3_vl"} else None,
+        image_paths=image_paths,
     )
     reasoning, first_pass_final = strip_think_block(output)
     if model_key in {"summary", "quick"}:
@@ -1158,14 +1204,14 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
             model_key=model_key,
             reasoning_characters=len(reasoning),
         )
-        final_raw = generate_final_only(model_key, messages, reasoning)
+        final_raw = generate_final_only(model_key, messages, reasoning, image_paths=image_paths)
         leaked_reasoning, final_output = strip_think_block(final_raw)
         if leaked_reasoning:
             reasoning = "\n\n".join(part for part in (reasoning, leaked_reasoning) if part)
     else:
         final_output = first_pass_final
         if final_answer_missing(final_output):
-            retry_output = generate_final_only(model_key, messages, reasoning)
+            retry_output = generate_final_only(model_key, messages, reasoning, image_paths=image_paths)
             retry_reasoning, final_output = strip_think_block(retry_output)
             if retry_reasoning:
                 reasoning = "\n\n".join(part for part in (reasoning, retry_reasoning) if part)
@@ -1475,7 +1521,7 @@ def summarize_article_batch(prompt: str, urls: list[str], model_key: str = DEFAU
     output = generate_with_model(
         selected_key, messages,
         max_tokens=MODEL_OPTIONS[selected_key]["max_tokens"],
-        enable_thinking=False if selected_key in {"default", "gemma"} else None,
+        enable_thinking=False if selected_key in {"default", "gemma", "qwen3_vl"} else None,
     )
     reasoning, final_output = strip_think_block(output)
     if selected_key in {"summary", "quick"} or final_answer_missing(final_output):
@@ -1673,7 +1719,7 @@ def summarize_youtube_batch(
         user = f"ORIGINAL USER PROMPT:\n{prompt}\n\n" + "\n\n---\n\n".join(transcript_blocks)
         model_key = normalize_model_key(model_key)
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        output = generate_with_model(model_key, messages, max_tokens=MODEL_OPTIONS[model_key]["max_tokens"], enable_thinking=False if model_key in {"default", "gemma"} else None)
+        output = generate_with_model(model_key, messages, max_tokens=MODEL_OPTIONS[model_key]["max_tokens"], enable_thinking=False if model_key in {"default", "gemma", "qwen3_vl"} else None)
         reasoning, final_output = strip_think_block(output)
         if model_key in {"summary", "quick"} or final_answer_missing(final_output):
             if not reasoning and final_output and model_key in {"summary", "quick"}: reasoning = final_output
@@ -1731,7 +1777,7 @@ def summarize_youtube(url: str, model_key: str = DEFAULT_MODEL_KEY) -> tuple[str
             model_key,
             youtube_messages,
             max_tokens=MODEL_OPTIONS[model_key]["max_tokens"],
-            enable_thinking=False if model_key in {"default", "gemma"} else None,
+            enable_thinking=False if model_key in {"default", "gemma", "qwen3_vl"} else None,
         )
         reasoning, first_pass_final = strip_think_block(output)
         if model_key in {"summary", "quick"}:
@@ -2551,7 +2597,7 @@ def upload():
     errors = []
     incoming_files = request.files.getlist("files")
     if len(incoming_files) > MAX_UPLOAD_FILES:
-        return jsonify(error=f"You can upload a maximum of {MAX_UPLOAD_FILES} documents at once."), 400
+        return jsonify(error=f"You can upload a maximum of {MAX_UPLOAD_FILES} files at once."), 400
     for incoming in incoming_files:
         name = secure_filename(incoming.filename or "")
         if not name:
@@ -2559,11 +2605,19 @@ def upload():
         destination = folder / name
         incoming.save(destination)
         try:
-            text = extract_text(destination)
-            current_session["files"] = [item for item in current_session["files"] if item["name"] != name]
-            current_session["files"].append({"name": name, "text": text})
-            added.append({"name": name, "characters": len(text)})
-            log("Attachment loaded", name=name, characters=len(text))
+            extension = destination.suffix.lower()
+            if extension in IMAGE_EXTENSIONS:
+                metadata = validate_image(destination)
+                current_session["images"] = [item for item in current_session.get("images", []) if item["name"] != name]
+                current_session["images"].append({"name": name, "path": str(destination), **metadata})
+                added.append({"name": name, "kind": "image", **metadata})
+                log("Image attachment loaded", name=name, **metadata)
+            else:
+                text = extract_text(destination)
+                current_session["files"] = [item for item in current_session["files"] if item["name"] != name]
+                current_session["files"].append({"name": name, "text": text})
+                added.append({"name": name, "kind": "document", "characters": len(text)})
+                log("Attachment loaded", name=name, characters=len(text))
         except Exception as exc:
             errors.append({"name": name, "error": str(exc)})
             destination.unlink(missing_ok=True)
@@ -2729,7 +2783,7 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
 <button id="themeToggle" class="theme-toggle" type="button" aria-label="Switch to dark mode" title="Switch to dark mode">Dark</button>
 <div id="systemHealth" class="system-health" role="status" aria-live="polite" title="System-wide physical memory; updates every 10 seconds"><span class="health-label">Memory</span><span id="memorySummary" class="health-value">checking...</span></div>
 <h1>Steve's AI Tool</h1>
-<div class="sub">Local reasoning, direct article reading, web retrieval, YouTube and uploaded-media transcription, local files, live mode, and multilingual voice interaction.</div>
+<div class="sub">Local reasoning, direct article reading, web retrieval, YouTube and uploaded-media transcription, local files and images, live mode, and multilingual voice interaction.</div>
 <section class="search-panel">
 <h2>Exa Search</h2>
 <div class="sub">Run as many searches as needed. Results accumulate below, and every selected article is available to the model for analysis.</div>
@@ -2751,13 +2805,13 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
 <div class="search-results" id="searchResults"></div>
 </section>
 <textarea id="prompt" placeholder="Paste an article URL for an English summary, or ask the model to analyse search results, attached files, or another topic..."></textarea>
-<div class="model-choice"><label for="modelSelect">Model for this prompt</label><select id="modelSelect"><option value="default" selected>Default — Qwen3 14B</option><option value="reasoning">DeepSeek Logical Reasoning</option><option value="summary">Summarization — Qwen3.5 9B</option><option value="quick">Quick Summarization — Qwen3.5 4B</option><option value="gemma">Multimodal analysis &amp; reasoning — Gemma 4 12B</option></select></div>
+<div class="model-choice"><label for="modelSelect">Model for this prompt</label><select id="modelSelect"><option value="default" selected>Default — Qwen3 14B</option><option value="reasoning">DeepSeek Logical Reasoning</option><option value="summary">Summarization — Qwen3.5 9B</option><option value="quick">Quick Summarization — Qwen3.5 4B</option><option value="gemma">Multimodal analysis &amp; reasoning — Gemma 4 12B</option><option value="qwen3_vl">Screenshots, OCR, charts &amp; documents — Qwen3-VL 8B</option></select></div>
 <div class="bar">
 <button class="primary" id="send">Run prompt</button>
 <button id="live" title="Speak a prompt through the Mac microphone">🎙 Start live mode</button>
 <button id="micMute" disabled title="Mute or unmute the microphone during live mode">🔇 Mute mic</button>
 <label title="Suppress the completion beep"><input type="checkbox" id="silent"> Silent mode</label>
-<label class="upload" for="files">Attach up to 15 documents</label><input id="files" type="file" multiple>
+<label class="upload" for="files">Attach up to 15 files/images</label><input id="files" type="file" multiple accept=".txt,.md,.csv,.json,.py,.log,.html,.xml,.pdf,.docx,.xlsx,.jpg,.jpeg,.png,.webp,.bmp,.gif,.tif,.tiff,image/*">
 <label class="upload" for="mediaFile">Attach audio/video</label><input id="mediaFile" type="file" accept="audio/*,video/*,.mkv,.m4a,.opus,.flac">
 <button class="danger" id="reset">Reset</button><span class="status" id="status">Ready</span>
 </div>
@@ -2766,7 +2820,7 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
   <div class="live-transcript" id="liveTranscript">Waiting for speech...</div>
   <div class="live-stage" id="liveStage"><span class="live-dot"></span><span id="liveStageText">Listening...</span></div>
 </div>
-<div class="files" id="fileList">No files attached.</div>
+<div class="files" id="fileList">No documents or images attached.</div>
 <div class="files" id="mediaStatus">No audio or video attached.</div>
 <div class="audio"><label>Playback speed <select id="speed"><option value="0.75">0.75x</option><option value="1" selected>1.0x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2.0x</option></select></label><audio id="player" controls></audio></div>
 <div id="history"></div>
@@ -3141,13 +3195,13 @@ $('mediaFile').onchange=async()=>{
 };
 $('send').onclick=async()=>{const p=$('prompt').value.trim();if(!p)return;const started=performance.now();const youtubeUrls=extractYoutubeUrlsFromPrompt(p);let youtubeSegments=[],mediaSegment=null;try{if(uploadedMedia&&!youtubeUrls.length){busy(true,'Choose the audio or video segment to transcribe...');mediaSegment=await chooseLocalMediaSegment();if(mediaSegment===null){busy(false,'Media transcription cancelled.');return}}else if(youtubeUrls.length){busy(true,'Loading YouTube video details...');youtubeSegments=await chooseYoutubeSegments(p);if(youtubeSegments===null){busy(false,'YouTube transcription cancelled.');return}}const mediaWork=Boolean(mediaSegment);busy(true,mediaWork?'Transcribing the selected audio or video segment...':youtubeUrls.length?`Transcribing ${youtubeUrls.length} selected video segment${youtubeUrls.length===1?'':'s'}...`:'Reasoning over the approved evidence...');const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,prompt:p,youtube_segments:youtubeSegments,media_segment:mediaSegment,use_search_results:true,selected_source_indices:selectedSearchResultIndices(),selected_source_urls:selectedSearchResultUrls(),max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})});const d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;const elapsed=Number(d.elapsed_seconds||((performance.now()-started)/1000));addTurn(p,d.answer,d.sources,elapsed,d.response_type||'standard',d.reasoning||'',d.model_label||'');$('prompt').value='';busy(false,`Complete in ${elapsed.toFixed(2)}s`);beep()}catch(e){$('youtubeModalBackdrop').hidden=true;$('mediaModalBackdrop').hidden=true;busy(false,'Error: '+e.message)}};
 $('prompt').onkeydown=e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')$('send').click()};
-$('files').onchange=async()=>{const selectedFiles=Array.from($('files').files);if(selectedFiles.length>15){$('status').textContent='Select no more than 15 documents at once.';$('files').value='';return}const fd=new FormData();fd.append('session_id',sid);for(const file of selectedFiles)fd.append('files',file);busy(true,'Reading files...');try{const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;$('fileList').textContent=(d.added.length?'Attached: '+d.added.map(x=>`${x.name} (${x.characters.toLocaleString()} chars)`).join(', '):'No files attached.')+(d.errors.length?' Errors: '+d.errors.map(x=>x.name+': '+x.error).join('; '):'');busy(false,'Files ready')}catch(e){busy(false,'Error: '+e.message)}finally{$('files').value=''}};
+$('files').onchange=async()=>{const selectedFiles=Array.from($('files').files);if(selectedFiles.length>15){$('status').textContent='Select no more than 15 documents at once.';$('files').value='';return}const fd=new FormData();fd.append('session_id',sid);for(const file of selectedFiles)fd.append('files',file);busy(true,'Reading files...');try{const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;$('fileList').textContent=(d.added.length?'Attached: '+d.added.map(x=>x.kind==='image'?`${x.name} (image ${x.width}x${x.height})`:`${x.name} (${Number(x.characters||0).toLocaleString()} chars)`).join(', '):'No documents or images attached.')+(d.errors.length?' Errors: '+d.errors.map(x=>x.name+': '+x.error).join('; '):'');busy(false,'Files ready')}catch(e){busy(false,'Error: '+e.message)}finally{$('files').value=''}};
 $('speed').onchange=()=>$('player').playbackRate=Number($('speed').value);
 $('maxArticles').oninput=()=>{$('maxArticlesValue').textContent=String(Number($('maxArticles').value))};
 $('micMute').onclick=async()=>{try{await setMicMuted(!$('micMute').textContent.includes('Unmute'))}catch(e){$('status').textContent='Mic mute error: '+e.message}};
 $('live').onclick=async()=>{$('live').disabled=true;$('status').textContent=$('live').textContent.includes('Stop')?'Stopping live mode...':'Starting microphone...';try{const r=await fetch('/api/live_toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,use_search_results:true,max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;$('live').textContent=d.active?'⏹ Stop live mode':'🎙 Start live mode';$('micMute').disabled=!d.active;$('micMute').textContent=d.muted?'🎤 Unmute mic':'🔇 Mute mic';$('status').textContent=d.active?(d.muted?'Live mode active — microphone muted':'Listening for a spoken prompt...'):'Live mode stopped';if(d.active)showLiveActivity(null,d.muted?'Microphone muted.':'Listening for a spoken prompt...',true);else showLiveActivity(null,'Live mode stopped.',false)}catch(e){$('status').textContent='Live error: '+e.message}finally{$('live').disabled=false}};
 setInterval(async()=>{try{const r=await fetch('/api/live_poll'),d=await r.json();$('live').textContent=d.active?'⏹ Stop live mode':'🎙 Start live mode';$('micMute').disabled=!d.active;$('micMute').textContent=d.muted?'🎤 Unmute mic':'🔇 Mute mic';for(const item of d.items){const type=item.type||('answer'in item?'result':('error'in item?'error':'status'));if(type==='transcript'){showLiveActivity(item.prompt,item.message||'Message received. Preparing your response...',true);continue}if(type==='status'){showLiveActivity(null,item.message||'Working...',true);continue}if(type==='error'){showLiveActivity(null,item.message||('Live error: '+item.error),false);$('status').textContent='Live error: '+item.error;continue}if(type==='result'){showLiveActivity(item.prompt,item.message||'Response ready.',false);addTurn(item.prompt,item.answer,item.sources,item.elapsed_seconds,'standard',item.reasoning||'',item.model_key||'');busy(false,`Live response complete in ${Number(item.elapsed_seconds).toFixed(2)}s`);beep()}}}catch(e){}},500);
-$('reset').onclick=async()=>{await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid})});sid=crypto.randomUUID();latest='';$('prompt').value='';$('searchQuery').value='';$('searchObjective').value='';$('includeDomains').value='';$('excludeDomains').value='';$('searchType').value='auto';$('userLocation').value='';$('contentModeration').checked=false;$('collapseHighlights').checked=true;setSearchLanguages(['en']);$('languagePicker').open=false;Array.from($('searchCategories').options).forEach(option=>option.selected=false);$('freshnessMode').value='cached';updateFreshnessFields();$('searchResults').innerHTML='';searchSuggestionGroups={};$('selectAllResultsWrap').hidden=true;$('selectAllResults').checked=true;$('selectAllResults').indeterminate=false;$('searchStatus').textContent='No search run.';$('searchStatus').dataset.summary='';$('searchStatus').dataset.selection='';$('history').innerHTML='';$('fileList').textContent='No files attached.';uploadedMedia=null;$('mediaStatus').textContent='No audio or video attached.';$('player').pause();$('player').removeAttribute('src');$('player').load();$('live').textContent='🎙 Start live mode';$('micMute').disabled=true;$('micMute').textContent='🔇 Mute mic';resetLiveActivity();$('status').textContent='Reset complete'};
+$('reset').onclick=async()=>{await fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid})});sid=crypto.randomUUID();latest='';$('prompt').value='';$('searchQuery').value='';$('searchObjective').value='';$('includeDomains').value='';$('excludeDomains').value='';$('searchType').value='auto';$('userLocation').value='';$('contentModeration').checked=false;$('collapseHighlights').checked=true;setSearchLanguages(['en']);$('languagePicker').open=false;Array.from($('searchCategories').options).forEach(option=>option.selected=false);$('freshnessMode').value='cached';updateFreshnessFields();$('searchResults').innerHTML='';searchSuggestionGroups={};$('selectAllResultsWrap').hidden=true;$('selectAllResults').checked=true;$('selectAllResults').indeterminate=false;$('searchStatus').textContent='No search run.';$('searchStatus').dataset.summary='';$('searchStatus').dataset.selection='';$('history').innerHTML='';$('fileList').textContent='No documents or images attached.';uploadedMedia=null;$('mediaStatus').textContent='No audio or video attached.';$('player').pause();$('player').removeAttribute('src');$('player').load();$('live').textContent='🎙 Start live mode';$('micMute').disabled=true;$('micMute').textContent='🔇 Mute mic';resetLiveActivity();$('status').textContent='Reset complete'};
 </script>
 </body></html>'''
 
