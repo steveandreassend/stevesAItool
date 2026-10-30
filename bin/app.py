@@ -272,7 +272,40 @@ def log(event: str, **fields: Any) -> None:
 
 def get_session(session_id: str) -> dict[str, Any]:
     with sessions_lock:
-        return sessions.setdefault(session_id, {"history": [], "files": [], "images": [], "search": None, "media": None})
+        return sessions.setdefault(session_id, {"history": [], "full_history": [], "files": [], "images": [], "search": None, "media": None})
+
+
+def record_chat_turn(current_session: dict[str, Any], prompt: str, output: str) -> None:
+    """Store the complete transcript for research suggestions and a rolling model context."""
+    turn = [{"role": "user", "content": prompt}, {"role": "assistant", "content": output}]
+    current_session.setdefault("full_history", []).extend(turn)
+    current_session["history"].extend(turn)
+    current_session["history"] = current_session["history"][-MAX_HISTORY_TURNS * 2 :]
+
+def active_attachment_metadata(current_session: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return safe metadata for attachments that remain active in the session."""
+    attachments: list[dict[str, Any]] = []
+    for item in current_session.get("files", []):
+        attachments.append({"kind": "document", "name": str(item.get("name") or "Attached document"), "characters": len(str(item.get("text") or ""))})
+    for item in current_session.get("images", []):
+        attachments.append({"kind": "image", "name": str(item.get("name") or "Attached image"), "width": int(item.get("width") or 0), "height": int(item.get("height") or 0), "format": str(item.get("format") or "")})
+    return attachments
+
+
+def consume_image_attachments(current_session: dict[str, Any], images_used: list[dict[str, Any]]) -> None:
+    """Remove only images used by a completed prompt while retaining its text response."""
+    if not images_used:
+        return
+    used_paths = {str(item.get("path") or "") for item in images_used}
+    current_session["images"] = [item for item in current_session.get("images", []) if str(item.get("path") or "") not in used_paths]
+    for item in images_used:
+        path = Path(str(item.get("path") or ""))
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError as exc:
+            log("Image attachment cleanup warning", name=item.get("name"), error=repr(exc))
+    log("Image attachments consumed after successful analysis", count=len(images_used))
 
 
 def normalize_model_key(model_key: str | None) -> str:
@@ -1021,6 +1054,22 @@ def clean_inline_citations(output: str) -> str:
         output,
         flags=re.I,
     )
+    # Vision models sometimes copy presentation-layer HTML from screenshots.
+    # Convert harmless emphasis tags to Markdown and remove all remaining tags
+    # before the browser renderer sees the response.
+    output = re.sub(r"<\s*(?:strong|b)\b[^>]*>(.*?)<\s*/\s*(?:strong|b)\s*>", r"**\1**", output, flags=re.I | re.S)
+    output = re.sub(r"<\s*(?:em|i)\b[^>]*>(.*?)<\s*/\s*(?:em|i)\s*>", r"*\1*", output, flags=re.I | re.S)
+    output = re.sub(r"<[^>]+>", "", output)
+
+    # Recover tables emitted as one dense line, where adjacent rows appear as
+    # `| |`. This is deliberately limited to lines that also contain a valid
+    # Markdown separator row so ordinary prose and empty cells are untouched.
+    repaired_lines: list[str] = []
+    for line in output.splitlines():
+        if line.count("| |") >= 2 and re.search(r"\|\s*:?-{3,}:?\s*\|", line):
+            line = re.sub(r"\|\s+\|(?=\s*(?:[^|\n]+\|))", "|\n|", line)
+        repaired_lines.append(line)
+    output = "\n".join(repaired_lines)
     output = re.sub(r"[ \t]+([,.;:!?])", r"\1", output)
     output = re.sub(r" {2,}", " ", output)
     return output.strip()
@@ -1167,7 +1216,8 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
         "When images are attached, base the answer on the pixels in those images. First identify the visible document or scene, then extract only legible facts relevant to the request. "
         "Do not substitute a remembered or unrelated image. If the image is unavailable, unreadable, or inconsistent with the question, say so explicitly rather than guessing. "
         "State uncertainty where image detail is unreadable or ambiguous. "
-        "Use ordinary prose, headings, and bullets where useful.\n\n"
+        "Use ordinary Markdown prose, headings, bullets, and tables where useful. Never emit HTML tags or CSS classes. "
+        "For tables, put the header, separator, and every data row on its own line and keep the same number of columns in every row.\n\n"
         + COMMUNICATION_STYLE
     )
     messages = [{"role": "system", "content": system}]
@@ -1222,10 +1272,10 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
         )
     output = clean_inline_citations(final_output)
 
-    current_session["history"].extend(
-        [{"role": "user", "content": prompt}, {"role": "assistant", "content": output}]
-    )
-    current_session["history"] = current_session["history"][-MAX_HISTORY_TURNS * 2 :]
+    record_chat_turn(current_session, prompt, output)
+    # Images are one-shot inputs. Keep the textual user/assistant turns, but do
+    # not let a used image leak into a later prompt or a text-only model.
+    consume_image_attachments(current_session, attached_images)
     log(
         "QWEN final synthesis complete",
         used_exa=use_web,
@@ -1311,6 +1361,42 @@ def generate_search_suggestions(
     log("Search suggestions generated", model_key=selected_key, suggestions=suggestions)
     return suggestions
 
+
+def generate_related_search_suggestions(
+    current_session: dict[str, Any], model_key: str = DEFAULT_MODEL_KEY
+) -> list[str]:
+    """Suggest three Exa searches based on the complete conversation so far."""
+    history = list(current_session.get("full_history") or current_session.get("history") or [])
+    if not history:
+        raise ValueError("There is no chat context available for related-search suggestions.")
+    transcript_parts: list[str] = []
+    for item in history:
+        role = str(item.get("role") or "unknown").upper()
+        content = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()
+        if content:
+            transcript_parts.append(f"{role}: {content}")
+    transcript = "\n".join(transcript_parts)
+    # Retain the most recent material if an exceptionally long session exceeds the planner budget.
+    transcript = transcript[-120000:]
+    system = (
+        "You are a research-query planner for Exa. Review the complete conversation and propose exactly three "
+        "searches that would most improve the user's current reasoning. Identify factual gaps, uncertain assumptions, "
+        "missing primary evidence, useful comparisons, counterarguments, current developments, or named entities that "
+        "would benefit from external verification. Each suggestion must be a self-contained Exa query with relevant "
+        "names, geography, timeframe, and analytical angle. Make the three searches complementary, not paraphrases. "
+        "Do not answer the topic. Return only a JSON array of three strings, with no explanation or markdown."
+    )
+    user = "COMPLETE CHAT SO FAR:\n" + transcript + "\n\nSuggest the three most useful related Exa searches now."
+    selected_key = normalize_model_key(model_key)
+    output = generate_with_model(
+        selected_key,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=500,
+        enable_thinking=False,
+    )
+    suggestions = clean_search_suggestions(output)
+    log("Chat-related search suggestions generated", model_key=selected_key, suggestions=suggestions)
+    return suggestions
 
 # -----------------------------------------------------------------------------
 # Direct article retrieval and summarization
@@ -2422,6 +2508,23 @@ def search_suggestions_route():
         return jsonify(error=str(exc)), 500
 
 
+@app.post("/api/related_searches")
+def related_searches_route():
+    data = request.get_json(force=True)
+    session_id = str(data.get("session_id") or "")
+    if not session_id:
+        return jsonify(error="No active chat session."), 400
+    try:
+        suggestions = generate_related_search_suggestions(
+            get_session(session_id),
+            str(data.get("model_key") or DEFAULT_MODEL_KEY),
+        )
+        return jsonify(session_id=session_id, suggestions=suggestions)
+    except Exception as exc:
+        log("Related search generation failed", error=repr(exc))
+        app.logger.exception("Related search generation failed")
+        return jsonify(error=str(exc)), 500
+
 @app.post("/api/youtube_metadata")
 def youtube_metadata_route():
     data = request.get_json(force=True)
@@ -2533,17 +2636,11 @@ def chat():
         if media_segment and uploaded_media:
             response_type = "media_analysis"
             output, reasoning, sources = analyze_local_media(prompt, uploaded_media, media_segment, model_key)
-            current_session["history"].extend(
-                [{"role": "user", "content": prompt}, {"role": "assistant", "content": output}]
-            )
-            current_session["history"] = current_session["history"][-MAX_HISTORY_TURNS * 2 :]
+            record_chat_turn(current_session, prompt, output)
         elif article_urls:
             response_type = "article_summary"
             output, reasoning, sources = summarize_article_batch(prompt, article_urls, model_key)
-            current_session["history"].extend(
-                [{"role": "user", "content": prompt}, {"role": "assistant", "content": output}]
-            )
-            current_session["history"] = current_session["history"][-MAX_HISTORY_TURNS * 2 :]
+            record_chat_turn(current_session, prompt, output)
         elif youtube_urls:
             if not youtube_segments:
                 youtube_segments = []
@@ -2558,10 +2655,7 @@ def chat():
             ordered_segments = [supplied[video_id] for video_id in requested_ids]
             response_type = "youtube_summary" if len(youtube_urls) == 1 and YOUTUBE_URL_RE.fullmatch(prompt) else "standard"
             output, reasoning, sources = summarize_youtube_batch(prompt, ordered_segments, model_key)
-            current_session["history"].extend(
-                [{"role": "user", "content": prompt}, {"role": "assistant", "content": output}]
-            )
-            current_session["history"] = current_session["history"][-MAX_HISTORY_TURNS * 2 :]
+            record_chat_turn(current_session, prompt, output)
         else:
             output, sources, reasoning = answer(prompt, current_session, use_web, model_key, max_web_results)
         elapsed = time.perf_counter() - started
@@ -2580,6 +2674,7 @@ def chat():
             reasoning=reasoning,
             model_key=model_key,
             model_label=MODEL_OPTIONS[model_key]["label"],
+            attachments=active_attachment_metadata(current_session),
         )
     except Exception as exc:
         log("Chat processing failed", error=repr(exc))
@@ -2622,7 +2717,7 @@ def upload():
             errors.append({"name": name, "error": str(exc)})
             destination.unlink(missing_ok=True)
             log("Attachment failed", name=name, error=repr(exc))
-    return jsonify(session_id=session_id, added=added, errors=errors)
+    return jsonify(session_id=session_id, added=added, errors=errors, attachments=active_attachment_metadata(current_session))
 
 
 @app.post("/api/tts")
@@ -2768,14 +2863,14 @@ h1{margin:0 0 4px;font-size:25px}.sub,.status,.files,.meta{color:var(--muted)}
 button,.upload,select{border:1px solid var(--line);background:#fff;border-radius:9px;padding:9px 14px;font:inherit;cursor:pointer}
 .primary{background:var(--blue);border-color:var(--blue);color:#fff}.danger{color:#b42318}button:disabled{opacity:.55;cursor:not-allowed}
 .turn{border-top:1px solid #ececf0;padding-top:15px;margin-top:15px}.response-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
-.response-tools{display:flex;gap:6px;align-items:center;flex-shrink:0}.response-tools select,.response-tools button{padding:5px 8px;font-size:12px}
-.prompt{font-weight:650;margin-bottom:8px}.answer{line-height:1.58}.answer h1,.answer h2,.answer h3,.answer h4,.youtube-section-body h1,.youtube-section-body h2,.youtube-section-body h3,.youtube-section-body h4{margin:1.05em 0 .42em;line-height:1.25}.answer h1,.youtube-section-body h1{font-size:1.35rem}.answer h2,.youtube-section-body h2{font-size:1.2rem}.answer h3,.youtube-section-body h3{font-size:1.08rem}.answer p,.youtube-section-body p{margin:.55em 0}.answer ul,.answer ol,.youtube-section-body ul,.youtube-section-body ol{margin:.55em 0 .75em;padding-left:1.45em}.answer li,.youtube-section-body li{margin:.28em 0}.answer strong,.youtube-section-body strong{font-weight:700}.answer code,.youtube-section-body code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;background:#0000000d;border-radius:4px;padding:.08em .3em}.answer pre,.youtube-section-body pre{overflow:auto;background:#111827;color:#f9fafb;border-radius:8px;padding:12px}.answer pre code,.youtube-section-body pre code{background:transparent;padding:0}.answer blockquote,.youtube-section-body blockquote{margin:.7em 0;padding:.15em 0 .15em 12px;border-left:3px solid var(--line);color:var(--muted)}.sources{font-size:13px;margin-top:10px}.sources a{color:var(--blue);word-break:break-word}
+.response-tools{display:flex;gap:6px;align-items:center;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}.response-tools select,.response-tools button{padding:5px 8px;font-size:12px}.related-searches{margin:10px 0 4px;padding:10px;border:1px solid var(--line);border-radius:9px;background:#f8fafc}.related-searches-title{font-size:12px;font-weight:700;color:var(--muted);margin-bottom:7px}.related-search-list{display:grid;gap:7px}.related-search-query{width:100%;text-align:left;padding:8px 10px;color:var(--blue)}
+.prompt{font-weight:650;margin-bottom:8px}.answer{line-height:1.58}.answer h1,.answer h2,.answer h3,.answer h4,.youtube-section-body h1,.youtube-section-body h2,.youtube-section-body h3,.youtube-section-body h4{margin:1.05em 0 .42em;line-height:1.25}.answer h1,.youtube-section-body h1{font-size:1.35rem}.answer h2,.youtube-section-body h2{font-size:1.2rem}.answer h3,.youtube-section-body h3{font-size:1.08rem}.answer p,.youtube-section-body p{margin:.55em 0}.answer ul,.answer ol,.youtube-section-body ul,.youtube-section-body ol{margin:.55em 0 .75em;padding-left:1.45em}.answer li,.youtube-section-body li{margin:.28em 0}.answer strong,.youtube-section-body strong{font-weight:700}.answer code,.youtube-section-body code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;background:#0000000d;border-radius:4px;padding:.08em .3em}.answer pre,.youtube-section-body pre{overflow:auto;background:#111827;color:#f9fafb;border-radius:8px;padding:12px}.answer pre code,.youtube-section-body pre code{background:transparent;padding:0}.answer blockquote,.youtube-section-body blockquote{margin:.7em 0;padding:.15em 0 .15em 12px;border-left:3px solid var(--line);color:var(--muted)}.table-wrap{max-width:100%;overflow-x:auto;margin:.8em 0;border:1px solid var(--line);border-radius:9px}.answer table,.youtube-section-body table{width:100%;border-collapse:collapse;font-size:.93em;background:#fff}.answer th,.answer td,.youtube-section-body th,.youtube-section-body td{padding:8px 10px;border-bottom:1px solid var(--line);border-right:1px solid var(--line);text-align:left;vertical-align:top;white-space:nowrap}.answer th:last-child,.answer td:last-child,.youtube-section-body th:last-child,.youtube-section-body td:last-child{border-right:0}.answer tr:last-child td,.youtube-section-body tr:last-child td{border-bottom:0}.answer th,.youtube-section-body th{font-weight:700;background:#f3f6f9;position:sticky;top:0}.sources{font-size:13px;margin-top:10px}.sources a{color:var(--blue);word-break:break-word}
 .reasoning-block{margin:10px 0;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#00000005}.reasoning-block summary{cursor:pointer;font-size:13px;font-weight:650;color:var(--muted)}.reasoning-content{margin-top:8px;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45}.meta{display:flex;gap:14px;align-items:center;margin-top:9px;font-size:12px}.copy-link{border:0;background:transparent!important;padding:0;color:var(--blue);font-size:12px}.copy-link:hover{text-decoration:underline}
 .youtube-sections{display:grid;gap:14px;margin-top:8px}.youtube-section{border:1px solid var(--line);border-radius:11px;padding:14px;background:#fbfcfe}.youtube-section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:9px}.youtube-section-title{font-size:17px;font-weight:700}.youtube-section-tools{display:flex;gap:6px;align-items:center;flex-shrink:0}.youtube-section-tools select,.youtube-section-tools button{padding:5px 8px;font-size:12px}.youtube-section-body{line-height:1.58}
 input[type=file]{display:none}audio{width:min(520px,100%)}
 .youtube-modal-backdrop{position:fixed;inset:0;z-index:100;background:#0009;display:flex;align-items:center;justify-content:center;padding:18px}.youtube-modal{width:min(760px,100%);max-height:88vh;overflow:auto;background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:0 20px 60px #0005;padding:20px}.youtube-modal h2{margin:0 0 5px}.youtube-modal-list{display:grid;gap:14px;margin:16px 0}.youtube-segment-card{border:1px solid var(--line);border-radius:11px;padding:13px}.youtube-video-title{font-weight:700;margin-bottom:4px}.youtube-video-url-row{display:flex;gap:8px;align-items:center}.youtube-video-url{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px}.youtube-copy-url{padding:4px 7px;font-size:11px;flex:0 0 auto}.youtube-time-row{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;margin-top:12px}.youtube-time-value{font-variant-numeric:tabular-nums;font-weight:700;text-align:center}.youtube-range{width:100%;padding:0;border:0}.youtube-modal-actions{display:flex;justify-content:flex-end;gap:9px}.youtube-modal-error{color:#b42318;font-size:13px;margin-top:8px}:root[data-theme="dark"] .youtube-modal{background:#1c1d21}
 @media(max-width:700px){.search-grid{grid-template-columns:1fr}.search-field.full{grid-column:auto}.response-head{display:block}.response-tools{margin:5px 0 10px}.bar{align-items:flex-start}}
-:root[data-theme="dark"] body{background:#111215;color:#f3f3f5}:root[data-theme="dark"] .card{background:#1c1d21;border-color:#34353b}:root[data-theme="dark"] textarea,:root[data-theme="dark"] button,:root[data-theme="dark"] .upload,:root[data-theme="dark"] select{background:#25262b;color:#f3f3f5;border-color:#45464d}:root[data-theme="dark"] .turn{border-color:#34353b}:root[data-theme="dark"] .live-activity,:root[data-theme="dark"] .search-panel{background:#23252a}:root[data-theme="dark"] .search-suggestions{background:#202227}:root[data-theme="dark"] .search-result.excluded{background:#191a1e}:root[data-theme="dark"] .search-batch-heading{background:#292c32}:root[data-theme="dark"] .youtube-section{background:#202227}:root[data-theme="dark"] .language-picker summary,:root[data-theme="dark"] .language-popout{background:#25262b;color:#f3f3f5;border-color:#45464d}
+:root[data-theme="dark"] body{background:#111215;color:#f3f3f5}:root[data-theme="dark"] .card{background:#1c1d21;border-color:#34353b}:root[data-theme="dark"] textarea,:root[data-theme="dark"] button,:root[data-theme="dark"] .upload,:root[data-theme="dark"] select{background:#25262b;color:#f3f3f5;border-color:#45464d}:root[data-theme="dark"] .turn{border-color:#34353b}:root[data-theme="dark"] .live-activity,:root[data-theme="dark"] .search-panel{background:#23252a}:root[data-theme="dark"] .search-suggestions,:root[data-theme="dark"] .related-searches{background:#202227}:root[data-theme="dark"] .search-result.excluded{background:#191a1e}:root[data-theme="dark"] .search-batch-heading{background:#292c32}:root[data-theme="dark"] .youtube-section{background:#202227}:root[data-theme="dark"] .answer table,:root[data-theme="dark"] .youtube-section-body table{background:#202227}:root[data-theme="dark"] .answer th,:root[data-theme="dark"] .youtube-section-body th{background:#292c32}:root[data-theme="dark"] .language-picker summary,:root[data-theme="dark"] .language-popout{background:#25262b;color:#f3f3f5;border-color:#45464d}
 .system-health{position:sticky;top:0;z-index:30;display:flex;align-items:center;justify-content:center;gap:5px;min-height:24px;margin:-12px 54px 8px;padding:4px 8px;background:#fff;border-bottom:1px solid transparent;color:var(--muted);font-size:10.5px;line-height:1.25;letter-spacing:.01em;white-space:nowrap}.system-health .health-label{font-weight:600;color:inherit}.system-health .health-value{font-variant-numeric:tabular-nums}.system-health .health-separator{opacity:.55}.system-health[data-level="high"]{color:#a15c00}.system-health[data-level="critical"]{color:#b42318}:root[data-theme="dark"] .system-health[data-level="high"]{color:#f0b35b}:root[data-theme="dark"] .system-health{background:#1c1d21}:root[data-theme="dark"] .system-health[data-level="critical"]{color:#ff8178}@media(max-width:680px){.system-health{margin:-8px 46px 9px;white-space:normal;text-align:center;flex-wrap:wrap}}
 </style>
 </head>
@@ -2890,51 +2985,72 @@ function inlineMarkdown(text){
   value=value.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g,'$1<em>$2</em>');
   return value;
 }
+function splitMarkdownTableRow(line){
+  let value=String(line||'').trim();
+  if(value.startsWith('|'))value=value.slice(1);
+  if(value.endsWith('|'))value=value.slice(0,-1);
+  const cells=[];let cell='',escaped=false;
+  for(const char of value){
+    if(escaped){cell+=char;escaped=false;continue}
+    if(char==='\\'){cell+=char;escaped=true;continue}
+    if(char==='|'){cells.push(cell.trim());cell='';continue}
+    cell+=char;
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+function isMarkdownTableSeparator(line){
+  const cells=splitMarkdownTableRow(line);
+  return cells.length>0&&cells.every(cell=>/^:?-{3,}:?$/.test(cell.trim()));
+}
 function renderMarkdown(markdown){
-  const lines=String(markdown||'').replace(/\r\n/g,'\n').split('\n');
+  let normalized=String(markdown||'').replace(/\r\n/g,'\n');
+  // Some vision-model generations place every table row on one line as `| |`.
+  // Repair only strings that contain a Markdown separator row.
+  normalized=normalized.split('\n').map(line=>{
+    if((line.match(/\|\s+\|/g)||[]).length>=2&&/\|\s*:?-{3,}:?\s*\|/.test(line)){
+      return line.replace(/\|\s+\|(?=\s*[^|\n]+\|)/g,'|\n|');
+    }
+    return line;
+  }).join('\n');
+  const lines=normalized.split('\n');
   let html='',paragraph=[],listType=null,code=false,codeLines=[];
   const flushParagraph=()=>{if(paragraph.length){html+='<p>'+inlineMarkdown(paragraph.join(' '))+'</p>';paragraph=[]}};
   const closeList=()=>{if(listType){html+=`</${listType}>`;listType=null}};
   const flushCode=()=>{if(codeLines.length){html+='<pre><code>'+esc(codeLines.join('\n'))+'</code></pre>';codeLines=[]}};
-  for(const raw of lines){
-    if(/^\s*```/.test(raw)){
-      if(code){flushCode();code=false}else{flushParagraph();closeList();code=true}
+  for(let index=0;index<lines.length;index++){
+    const raw=lines[index];
+    if(/^\s*```/.test(raw)){if(code){flushCode();code=false}else{flushParagraph();closeList();code=true}continue}
+    if(code){codeLines.push(raw);continue}
+    if(index+1<lines.length&&raw.includes('|')&&isMarkdownTableSeparator(lines[index+1])){
+      flushParagraph();closeList();
+      const headers=splitMarkdownTableRow(raw);index+=2;
+      const rows=[];
+      while(index<lines.length&&lines[index].trim()&&lines[index].includes('|')){rows.push(splitMarkdownTableRow(lines[index]));index++}
+      index--;
+      const columnCount=headers.length;
+      const head='<thead><tr>'+headers.map(cell=>'<th>'+inlineMarkdown(cell)+'</th>').join('')+'</tr></thead>';
+      const body=rows.map(row=>{
+        const normalizedRow=row.slice(0,columnCount);
+        while(normalizedRow.length<columnCount)normalizedRow.push('');
+        return '<tr>'+normalizedRow.map(cell=>'<td>'+inlineMarkdown(cell)+'</td>').join('')+'</tr>';
+      }).join('');
+      html+='<div class="table-wrap"><table>'+head+'<tbody>'+body+'</tbody></table></div>';
       continue;
     }
-    if(code){codeLines.push(raw);continue}
     const heading=raw.match(/^\s*(#{1,4})\s+(.+?)\s*$/);
     if(heading){flushParagraph();closeList();const level=heading[1].length;html+=`<h${level}>${inlineMarkdown(heading[2].replace(/\s+#+\s*$/,''))}</h${level}>`;continue}
-    const unordered=raw.match(/^\s*[-*•]\s+(.+)$/);
-    const ordered=raw.match(/^\s*(\d+)[.)]\s+(.+)$/);
-    if(unordered||ordered){
-      flushParagraph();
-      const wanted=unordered?'ul':'ol';
-      if(listType!==wanted){
-        closeList();
-        listType=wanted;
-        if(ordered){const startNumber=Number(ordered[1]);html+=startNumber===1?'<ol>':`<ol start="${startNumber}">`}
-        else html+='<ul>';
-      }
-      html+='<li>'+inlineMarkdown(unordered?unordered[1]:ordered[2])+'</li>';
-      continue;
-    }
-    if(/^\s*$/.test(raw)){
-      // A blank line between Markdown list items is valid and must not close
-      // the list. Look ahead to determine whether the next content line is
-      // another item of the same type.
-      flushParagraph();
-      continue;
-    }
-    const quote=raw.match(/^\s*>\s?(.*)$/);
-    if(quote){flushParagraph();closeList();html+='<blockquote>'+inlineMarkdown(quote[1])+'</blockquote>';continue}
+    const unordered=raw.match(/^\s*[-*•]\s+(.+)$/);const ordered=raw.match(/^\s*(\d+)[.)]\s+(.+)$/);
+    if(unordered||ordered){flushParagraph();const wanted=unordered?'ul':'ol';if(listType!==wanted){closeList();listType=wanted;if(ordered){const startNumber=Number(ordered[1]);html+=startNumber===1?'<ol>':`<ol start="${startNumber}">`}else html+='<ul>'}html+='<li>'+inlineMarkdown(unordered?unordered[1]:ordered[2])+'</li>';continue}
+    if(/^\s*$/.test(raw)){flushParagraph();continue}
+    const quote=raw.match(/^\s*>\s?(.*)$/);if(quote){flushParagraph();closeList();html+='<blockquote>'+inlineMarkdown(quote[1])+'</blockquote>';continue}
     closeList();paragraph.push(raw.trim());
   }
-  if(code){flushCode()}
-  flushParagraph();closeList();
-  return html;
+  if(code)flushCode();flushParagraph();closeList();return html;
 }
 const langOptions='<option value="en">English</option><option value="fr">French</option><option value="es">Spanish</option><option value="de">German</option><option value="it">Italian</option><option value="nl">Dutch</option><option value="pt">Portuguese</option>';
-function busy(on,text){$('send').disabled=on;$('runSearch').disabled=on;document.querySelectorAll('.suggest-searches-button').forEach(button=>button.disabled=on);$('status').textContent=text||'Ready'}
+function busy(on,text){$('send').disabled=on;$('runSearch').disabled=on;document.querySelectorAll('.suggest-searches-button,.related-searches-button').forEach(button=>button.disabled=on);$('status').textContent=text||'Ready'}
+function renderActiveAttachments(attachments){const items=attachments||[];$('fileList').textContent=items.length?'Attached: '+items.map(item=>item.kind==='image'?`${item.name} (image ${item.width}x${item.height})`:`${item.name} (${Number(item.characters||0).toLocaleString()} chars)`).join(', '):'No documents or images attached.'}
 function showLiveActivity(transcript,message,working=true){$('liveActivity').classList.add('active');if(transcript!==null&&transcript!==undefined)$('liveTranscript').textContent=transcript;$('liveStageText').textContent=message||'';const dot=$('liveActivity').querySelector('.live-dot');dot.style.display=working?'inline-block':'none';$('status').textContent=message||$('status').textContent}
 function resetLiveActivity(){ $('liveActivity').classList.remove('active');$('liveTranscript').textContent='Waiting for speech...';$('liveStageText').textContent='Listening...' }
 function beep(){if($('silent').checked)return;try{const C=window.AudioContext||window.webkitAudioContext,a=new C(),o=a.createOscillator(),g=a.createGain();o.type='sine';o.frequency.value=660;g.gain.setValueAtTime(.0001,a.currentTime);g.gain.exponentialRampToValueAtTime(.035,a.currentTime+.012);g.gain.exponentialRampToValueAtTime(.0001,a.currentTime+.13);o.connect(g);g.connect(a.destination);o.start();o.stop(a.currentTime+.14);o.onended=()=>a.close()}catch(e){}}
@@ -3019,10 +3135,40 @@ function addTurn(prompt,answer,sources,elapsed,responseType='standard',reasoning
   latest=answer;
   const src=(sources||[]).map((s,i)=>s.url?`<div><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title||('Source '+(i+1)))}</a></div>`:`<div>${esc(s.title||('Source '+(i+1)))}</div>`).join('');
   const sections=responseType==='youtube_summary'?parseYoutubeSections(answer):null;
-  const responseHtml=sections?`<div class="youtube-sections">${youtubeSection('Executive Summary',sections['Executive Summary'])}${youtubeSection('Key Points',sections['Key Points'])}${youtubeSection('Conclusion',sections['Conclusion'])}</div>`:`<div class="response-head"><div class="prompt">${esc(prompt)}</div><div class="response-tools"><select class="read-lang" aria-label="Read aloud language">${langOptions}</select><button onclick="readTurn(this)">🔊 Read aloud</button></div></div><div class="answer">${renderMarkdown(answer)}</div>`;
+  const relatedButton='<button type="button" class="related-searches-button" onclick="suggestRelatedSearches(this)" title="Use the complete chat to propose three Exa searches">Suggest Related Searches</button>';
+  const responseHtml=sections?`<div class="response-head"><div></div><div class="response-tools">${relatedButton}</div></div><div class="youtube-sections">${youtubeSection('Executive Summary',sections['Executive Summary'])}${youtubeSection('Key Points',sections['Key Points'])}${youtubeSection('Conclusion',sections['Conclusion'])}</div>`:`<div class="response-head"><div class="prompt">${esc(prompt)}</div><div class="response-tools"><select class="read-lang" aria-label="Read aloud language">${langOptions}</select><button onclick="readTurn(this)">🔊 Read aloud</button>${relatedButton}</div></div><div class="answer">${renderMarkdown(answer)}</div>`;
   const promptHtml=sections?`<div class="prompt">${esc(prompt)}</div>`:'';
   const reasoningHtml=reasoning?`<details class="reasoning-block"><summary>Show reasoning — ${esc(modelLabel||'selected model')}</summary><div class="reasoning-content">${esc(reasoning)}</div></details>`:'';
   $('history').insertAdjacentHTML('afterbegin',`<article class="turn" data-response-type="${esc(responseType)}">${promptHtml}${reasoningHtml}${responseHtml}<div class="answer" hidden>${esc(answer)}</div><div class="sources">${src}</div><div class="meta"><span>Completed in ${Number(elapsed).toFixed(2)}s</span><button class="copy-link" onclick="copyResponse(this)">Copy response</button></div></article>`)
+}
+function relatedSearchesHtml(suggestions){
+  return `<section class="related-searches"><div class="related-searches-title">Three related Exa searches based on the complete chat</div><div class="related-search-list">${(suggestions||[]).map((query,index)=>`<button type="button" class="related-search-query" data-query="${esc(query)}"><strong>${index+1}.</strong> ${esc(query)}</button>`).join('')}</div></section>`;
+}
+async function suggestRelatedSearches(button){
+  const turn=button.closest('.turn');
+  button.disabled=true;
+  const original=button.textContent;
+  button.textContent='Suggesting...';
+  $('status').textContent='Reviewing the complete chat for useful Exa searches...';
+  try{
+    const response=await fetch('/api/related_searches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,model_key:$('modelSelect').value})});
+    const data=await response.json();
+    if(!response.ok)throw Error(data.error||'Related-search suggestion failed');
+    const existing=turn.querySelector('.related-searches');
+    if(existing)existing.remove();
+    turn.querySelector('.response-head').insertAdjacentHTML('afterend',relatedSearchesHtml(data.suggestions));
+    turn.querySelectorAll('.related-search-query').forEach(queryButton=>queryButton.onclick=()=>{
+      $('searchQuery').value=queryButton.dataset.query||'';
+      $('searchQuery').focus();
+      $('runSearch').click();
+    });
+    $('status').textContent='Three related searches are ready. Click one to run it with the current Exa settings.';
+  }catch(error){
+    $('status').textContent='Related-search error: '+error.message;
+  }finally{
+    button.disabled=false;
+    button.textContent=original;
+  }
 }
 async function setMicMuted(muted){if(!$('live').textContent.includes('Stop'))return false;const r=await fetch('/api/live_mute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({muted})});const d=await r.json();if(!r.ok)throw Error(d.error||'Microphone mute failed');$('micMute').disabled=!d.active;$('micMute').textContent=d.muted?'🎤 Unmute mic':'🔇 Mute mic';$('status').textContent=d.muted?'Live mode active — microphone muted':'Listening for a spoken prompt...';showLiveActivity(null,d.muted?'Microphone muted.':'Listening for a spoken prompt...',true);return d.muted}
 async function loadAudioIntoPlayer(audioUrl){
@@ -3193,9 +3339,9 @@ $('mediaFile').onchange=async()=>{
   const fd=new FormData();fd.append('session_id',sid);fd.append('file',file);busy(true,'Uploading and inspecting media...');
   try{const r=await fetch('/api/media_upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;uploadedMedia=d.media;$('mediaStatus').textContent=`Attached media: ${d.media.name} · ${formatYoutubeTime(d.media.duration_seconds)} · ${(Number(d.media.bytes)/(1024*1024)).toFixed(1)} MB`;busy(false,'Media ready. Enter a prompt and run it.')}catch(e){uploadedMedia=null;$('mediaStatus').textContent='Media error: '+e.message;busy(false,'Error: '+e.message)}finally{$('mediaFile').value=''}
 };
-$('send').onclick=async()=>{const p=$('prompt').value.trim();if(!p)return;const started=performance.now();const youtubeUrls=extractYoutubeUrlsFromPrompt(p);let youtubeSegments=[],mediaSegment=null;try{if(uploadedMedia&&!youtubeUrls.length){busy(true,'Choose the audio or video segment to transcribe...');mediaSegment=await chooseLocalMediaSegment();if(mediaSegment===null){busy(false,'Media transcription cancelled.');return}}else if(youtubeUrls.length){busy(true,'Loading YouTube video details...');youtubeSegments=await chooseYoutubeSegments(p);if(youtubeSegments===null){busy(false,'YouTube transcription cancelled.');return}}const mediaWork=Boolean(mediaSegment);busy(true,mediaWork?'Transcribing the selected audio or video segment...':youtubeUrls.length?`Transcribing ${youtubeUrls.length} selected video segment${youtubeUrls.length===1?'':'s'}...`:'Reasoning over the approved evidence...');const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,prompt:p,youtube_segments:youtubeSegments,media_segment:mediaSegment,use_search_results:true,selected_source_indices:selectedSearchResultIndices(),selected_source_urls:selectedSearchResultUrls(),max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})});const d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;const elapsed=Number(d.elapsed_seconds||((performance.now()-started)/1000));addTurn(p,d.answer,d.sources,elapsed,d.response_type||'standard',d.reasoning||'',d.model_label||'');$('prompt').value='';busy(false,`Complete in ${elapsed.toFixed(2)}s`);beep()}catch(e){$('youtubeModalBackdrop').hidden=true;$('mediaModalBackdrop').hidden=true;busy(false,'Error: '+e.message)}};
+$('send').onclick=async()=>{const p=$('prompt').value.trim();if(!p)return;const started=performance.now();const youtubeUrls=extractYoutubeUrlsFromPrompt(p);let youtubeSegments=[],mediaSegment=null;try{if(uploadedMedia&&!youtubeUrls.length){busy(true,'Choose the audio or video segment to transcribe...');mediaSegment=await chooseLocalMediaSegment();if(mediaSegment===null){busy(false,'Media transcription cancelled.');return}}else if(youtubeUrls.length){busy(true,'Loading YouTube video details...');youtubeSegments=await chooseYoutubeSegments(p);if(youtubeSegments===null){busy(false,'YouTube transcription cancelled.');return}}const mediaWork=Boolean(mediaSegment);busy(true,mediaWork?'Transcribing the selected audio or video segment...':youtubeUrls.length?`Transcribing ${youtubeUrls.length} selected video segment${youtubeUrls.length===1?'':'s'}...`:'Reasoning over the approved evidence...');const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,prompt:p,youtube_segments:youtubeSegments,media_segment:mediaSegment,use_search_results:true,selected_source_indices:selectedSearchResultIndices(),selected_source_urls:selectedSearchResultUrls(),max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})});const d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;const elapsed=Number(d.elapsed_seconds||((performance.now()-started)/1000));addTurn(p,d.answer,d.sources,elapsed,d.response_type||'standard',d.reasoning||'',d.model_label||'');renderActiveAttachments(d.attachments);$('prompt').value='';busy(false,`Complete in ${elapsed.toFixed(2)}s`);beep()}catch(e){$('youtubeModalBackdrop').hidden=true;$('mediaModalBackdrop').hidden=true;busy(false,'Error: '+e.message)}};
 $('prompt').onkeydown=e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')$('send').click()};
-$('files').onchange=async()=>{const selectedFiles=Array.from($('files').files);if(selectedFiles.length>15){$('status').textContent='Select no more than 15 documents at once.';$('files').value='';return}const fd=new FormData();fd.append('session_id',sid);for(const file of selectedFiles)fd.append('files',file);busy(true,'Reading files...');try{const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;$('fileList').textContent=(d.added.length?'Attached: '+d.added.map(x=>x.kind==='image'?`${x.name} (image ${x.width}x${x.height})`:`${x.name} (${Number(x.characters||0).toLocaleString()} chars)`).join(', '):'No documents or images attached.')+(d.errors.length?' Errors: '+d.errors.map(x=>x.name+': '+x.error).join('; '):'');busy(false,'Files ready')}catch(e){busy(false,'Error: '+e.message)}finally{$('files').value=''}};
+$('files').onchange=async()=>{const selectedFiles=Array.from($('files').files);if(selectedFiles.length>15){$('status').textContent='Select no more than 15 documents at once.';$('files').value='';return}const fd=new FormData();fd.append('session_id',sid);for(const file of selectedFiles)fd.append('files',file);busy(true,'Reading files...');try{const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;renderActiveAttachments(d.attachments);if(d.errors.length)$('fileList').textContent+=' Errors: '+d.errors.map(x=>x.name+': '+x.error).join('; ');busy(false,'Files ready')}catch(e){busy(false,'Error: '+e.message)}finally{$('files').value=''}};
 $('speed').onchange=()=>$('player').playbackRate=Number($('speed').value);
 $('maxArticles').oninput=()=>{$('maxArticlesValue').textContent=String(Number($('maxArticles').value))};
 $('micMute').onclick=async()=>{try{await setMicMuted(!$('micMute').textContent.includes('Unmute'))}catch(e){$('status').textContent='Mic mute error: '+e.message}};
