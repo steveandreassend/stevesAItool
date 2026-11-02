@@ -586,8 +586,10 @@ def generate_final_only(
         "content": (
             "/no_think\n"
             "Give only the final user-facing answer. Do not output reasoning, analysis, "
-            "planning, self-review, a thinking process, or <think> tags. Start directly "
-            "with the substantive answer and make it complete."
+            "planning, self-review, a thinking process, or <think> tags. Answer the "
+            "CURRENT USER REQUEST in the immediately preceding user message, not an "
+            "earlier request from the conversation. Start directly with the substantive "
+            "answer and make it complete."
         ),
     })
     return generate_with_model(
@@ -1222,17 +1224,42 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
     )
     messages = [{"role": "system", "content": system}]
     messages.extend(current_session["history"][-MAX_HISTORY_TURNS * 2 :])
-    current_prompt = prompt
+    # Keep the current request unmistakably separate from prior turns. Repeating it at
+    # the end is intentional: large evidence blocks and model switches must not cause a
+    # reasoning model to resume an older user task instead of answering the new one.
+    current_prompt = (
+        "CURRENT USER REQUEST — ANSWER THIS REQUEST NOW:\n"
+        + prompt
+    )
     if evidence:
         current_prompt += (
             "\n\n--- CONTEXTUAL WEB QUERY USED ---\n"
             + exa_query
-            + "\n--- RETRIEVED EVIDENCE FOR QWEN TO ANALYZE ---\n"
+            + "\n--- RETRIEVED EVIDENCE FOR THE SELECTED MODEL TO ANALYZE ---\n"
             + evidence
             + "\n--- END RETRIEVED EVIDENCE ---\n"
             + "Write the final answer yourself. Do not emit inline citation markers or square-bracket references."
         )
+    current_prompt += (
+        "\n\n--- CURRENT USER REQUEST REPEATED FOR RECENCY ---\n"
+        + prompt
+        + "\n--- END CURRENT USER REQUEST ---\n"
+        + "Answer this current request. Use earlier conversation only as supporting context; "
+          "do not answer or continue an earlier request unless this request explicitly asks you to."
+    )
     messages.append({"role": "user", "content": current_prompt})
+    log(
+        "MODEL prompt assembled",
+        model_key=model_key,
+        history_messages=len(messages) - 2,
+        total_messages=len(messages),
+        current_request=prompt,
+        current_request_characters=len(prompt),
+        final_user_message_characters=len(current_prompt),
+        current_request_repeated_at_end=current_prompt.rstrip().endswith(
+            "do not answer or continue an earlier request unless this request explicitly asks you to."
+        ),
+    )
 
     started = time.perf_counter()
     output = generate_with_model(
