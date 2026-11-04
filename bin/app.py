@@ -292,6 +292,17 @@ def active_attachment_metadata(current_session: dict[str, Any]) -> list[dict[str
     return attachments
 
 
+def consume_document_attachments(current_session: dict[str, Any], files_used: list[dict[str, Any]]) -> None:
+    """Remove documents used by a completed prompt while retaining the chat transcript."""
+    if not files_used:
+        return
+    used_ids = {id(item) for item in files_used}
+    current_session["files"] = [
+        item for item in current_session.get("files", []) if id(item) not in used_ids
+    ]
+    log("Document attachments consumed after successful analysis", count=len(files_used))
+
+
 def consume_image_attachments(current_session: dict[str, Any], images_used: list[dict[str, Any]]) -> None:
     """Remove only images used by a completed prompt while retaining its text response."""
     if not images_used:
@@ -1189,8 +1200,9 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
         for index, item in enumerate(search_queries, 1)
     ).strip() or str((saved_search or {}).get("query") or "")
     web_context, sources = selected_search_evidence(saved_search)
+    attached_files = list(current_session.get("files", []))
     file_context = "\n\n".join(
-        f"LOCAL FILE: {item['name']}\n{item['text']}" for item in current_session["files"]
+        f"LOCAL FILE: {item['name']}\n{item['text']}" for item in attached_files
     )
     attached_images = [item for item in current_session.get("images", []) if Path(str(item.get("path") or "")).is_file()]
     image_paths = [str(item["path"]) for item in attached_images]
@@ -1223,7 +1235,14 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
         + COMMUNICATION_STYLE
     )
     messages = [{"role": "system", "content": system}]
-    messages.extend(current_session["history"][-MAX_HISTORY_TURNS * 2 :])
+    recent_history = current_session["history"][-MAX_HISTORY_TURNS * 2 :]
+    if attached_files:
+        # A newly attached document is the primary evidence for this turn. Prior
+        # assistant prose can strongly anchor deterministic models and cause an
+        # old answer to be repeated verbatim, so retain only prior user requests.
+        messages.extend(item for item in recent_history if item.get("role") == "user")
+    else:
+        messages.extend(recent_history)
     # Keep the current request unmistakably separate from prior turns. Repeating it at
     # the end is intentional: large evidence blocks and model switches must not cause a
     # reasoning model to resume an older user task instead of answering the new one.
@@ -1231,6 +1250,12 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
         "CURRENT USER REQUEST — ANSWER THIS REQUEST NOW:\n"
         + prompt
     )
+    if attached_files:
+        current_prompt += (
+            "\n\nIMPORTANT: One or more documents were attached specifically for this request. "
+            "Treat the attached document text below as the primary evidence. Do not reuse or repeat a prior answer. "
+            "Answer afresh from the attached material and the current request.\n"
+        )
     if evidence:
         current_prompt += (
             "\n\n--- CONTEXTUAL WEB QUERY USED ---\n"
@@ -1299,9 +1324,44 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
         )
     output = clean_inline_citations(final_output)
 
+    previous_answers = [
+        str(item.get("content") or "").strip()
+        for item in current_session.get("history", [])
+        if item.get("role") == "assistant"
+    ]
+    if attached_files and output.strip() and any(output.strip() == prior for prior in previous_answers):
+        log(
+            "Duplicate answer detected on document turn; retrying without conversation history",
+            model_key=model_key,
+            attachment_names=[item.get("name") for item in attached_files],
+        )
+        retry_messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": (
+                    "Answer the current request afresh using the attached document evidence. "
+                    "A previous generation duplicated an older response and is invalid. "
+                    "Do not reproduce any earlier answer.\n\n" + current_prompt
+                ),
+            },
+        ]
+        retry_raw = generate_with_model(
+            model_key,
+            retry_messages,
+            max_tokens=MODEL_OPTIONS[model_key]["max_tokens"],
+            enable_thinking=False if model_key in {"default", "gemma", "qwen3_vl"} else None,
+            image_paths=image_paths,
+        )
+        retry_reasoning, retry_final = strip_think_block(retry_raw)
+        if not final_answer_missing(retry_final):
+            output = clean_inline_citations(retry_final)
+            if retry_reasoning:
+                reasoning = "\n\n".join(part for part in (reasoning, retry_reasoning) if part)
+
     record_chat_turn(current_session, prompt, output)
-    # Images are one-shot inputs. Keep the textual user/assistant turns, but do
-    # not let a used image leak into a later prompt or a text-only model.
+    # Attachments are one-shot inputs after a successful answer.
+    consume_document_attachments(current_session, attached_files)
     consume_image_attachments(current_session, attached_images)
     log(
         "QWEN final synthesis complete",
@@ -2718,6 +2778,16 @@ def upload():
     added = []
     errors = []
     incoming_files = request.files.getlist("files")
+    incoming_has_documents = any(
+        Path(secure_filename(item.filename or "")).suffix.lower() not in IMAGE_EXTENSIONS
+        for item in incoming_files
+        if secure_filename(item.filename or "")
+    )
+    if incoming_has_documents:
+        # Starting a new document upload means starting a new evidence batch.
+        # This prevents a PDF from the preceding prompt remaining active and
+        # overshadowing the PDF attached for the current prompt.
+        current_session["files"] = []
     if len(incoming_files) > MAX_UPLOAD_FILES:
         return jsonify(error=f"You can upload a maximum of {MAX_UPLOAD_FILES} files at once."), 400
     for incoming in incoming_files:
