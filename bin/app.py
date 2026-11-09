@@ -471,10 +471,20 @@ def generate_with_model(
 
     prompt = apply_model_chat_template(loaded, messages, enable_thinking=enable_thinking)
     from mlx_lm import generate as lm_generate
+    generation_kwargs: dict[str, Any] = {}
+    if selected_key == "reasoning":
+        # DeepSeek-R1 follow-up turns should not use fully deterministic greedy
+        # decoding. With the prior answer in context, greedy decoding can lock
+        # onto that answer and reproduce it verbatim for a related second prompt.
+        try:
+            from mlx_lm.sample_utils import make_sampler
+            generation_kwargs["sampler"] = make_sampler(temp=0.6, top_p=0.95)
+        except (ImportError, TypeError) as exc:
+            log("DeepSeek sampler unavailable; using installed mlx-lm defaults", error=repr(exc))
     started = time.perf_counter()
     with model_lock:
         output = lm_generate(loaded["model"], loaded["tokenizer"], prompt=prompt,
-            max_tokens=token_limit, verbose=False).strip()
+            max_tokens=token_limit, verbose=False, **generation_kwargs).strip()
     log("MLX generation complete", model_key=selected_key, backend="mlx_lm",
         elapsed_seconds=round(time.perf_counter()-started, 2))
     return output
@@ -1329,9 +1339,12 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
         for item in current_session.get("history", [])
         if item.get("role") == "assistant"
     ]
-    if attached_files and output.strip() and any(output.strip() == prior for prior in previous_answers):
+    duplicate_previous_answer = bool(
+        output.strip() and any(output.strip() == prior for prior in previous_answers)
+    )
+    if duplicate_previous_answer and (attached_files or model_key == "reasoning"):
         log(
-            "Duplicate answer detected on document turn; retrying without conversation history",
+            "Duplicate answer detected; retrying without prior assistant responses",
             model_key=model_key,
             attachment_names=[item.get("name") for item in attached_files],
         )
@@ -1340,9 +1353,11 @@ def answer(prompt: str, current_session: dict[str, Any], use_web: bool, model_ke
             {
                 "role": "user",
                 "content": (
-                    "Answer the current request afresh using the attached document evidence. "
-                    "A previous generation duplicated an older response and is invalid. "
-                    "Do not reproduce any earlier answer.\n\n" + current_prompt
+                    "Answer the CURRENT request afresh. A previous generation duplicated an "
+                    "older response verbatim and is invalid. Do not reproduce any earlier "
+                    "answer. Focus on what is new or changed in the current user request. "
+                    + ("Use the attached document evidence as the primary evidence. " if attached_files else "")
+                    + "\n\n" + current_prompt
                 ),
             },
         ]
@@ -1598,7 +1613,15 @@ def fallback_article_extraction(html: str) -> str:
         re.I,
     )
     for node in list(soup.find_all(True)):
-        marker = " ".join([str(node.get("id") or ""), " ".join(node.get("class") or [])])
+        # BeautifulSoup Tag.decompose() clears the decomposed tag's attrs and
+        # also clears descendants that are still present in this snapshot.
+        # Skip those invalidated nodes before reading id/class attributes.
+        if not isinstance(getattr(node, "attrs", None), dict):
+            continue
+        classes = node.get("class") or []
+        if isinstance(classes, str):
+            classes = [classes]
+        marker = " ".join([str(node.get("id") or ""), " ".join(str(item) for item in classes)])
         if marker and noise.search(marker):
             node.decompose()
     candidates = list(soup.find_all("article")) + list(soup.find_all("main"))
@@ -1606,6 +1629,11 @@ def fallback_article_extraction(html: str) -> str:
     best_text = ""
     best_score = -1.0
     for node in candidates:
+        # A candidate can be invalidated if an ancestor was decomposed while
+        # removing page chrome. Ignore it rather than calling methods on a
+        # decomposed BeautifulSoup tag.
+        if not isinstance(getattr(node, "attrs", None), dict):
+            continue
         paragraphs = [p.get_text(" ", strip=True) for p in node.find_all(["p", "h1", "h2", "h3", "li"], recursive=True)]
         paragraphs = [re.sub(r"\s+", " ", item).strip() for item in paragraphs if len(item.split()) >= 4]
         text = "\n\n".join(dict.fromkeys(paragraphs))
@@ -3077,7 +3105,7 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 function inlineMarkdown(text){
   let value=esc(text);
   value=value.replace(/`([^`]+)`/g,'<code>$1</code>');
-  value=value.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  value=value.replace(/(?:\\)?\*\*(.+?)(?:\\)?\*\*/g,'<strong>$1</strong>');
   value=value.replace(/__([^_]+)__/g,'<strong>$1</strong>');
   value=value.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g,'$1<em>$2</em>');
   return value;
@@ -3214,7 +3242,7 @@ function parseYoutubeSections(answer){
     const heading=originalLine
       .trim()
       .replace(/^#{1,6}\s*/, '')
-      .replace(/^\*\*(.*?)\*\*\s*:??\s*$/, '$1')
+      .replace(/^(?:\\)?\*\*(.*?)(?:\\)?\*\*\s*:??\s*$/, '$1')
       .replace(/^__(.*?)__\s*:??\s*$/, '$1')
       .replace(/:\s*$/, '')
       .trim()
