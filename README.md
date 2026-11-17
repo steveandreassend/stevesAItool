@@ -27,6 +27,7 @@ The application is designed for research workflows where you want local model in
 
 **Languages:**
 - **Multilingual** - Reads, writes, speaks, and listens in multiple languages in a native dialect and accent.
+- **Unhinged mode** - Text-To-Speech includes an optional Unhinged mode for generating more colorful explanations.
 - **Voice control** - Live AI chat mode, with a mic mute button.
 
 **Reasoning:**
@@ -260,6 +261,8 @@ Responses can be read aloud in:
 - Portuguese
 
 English uses Piper with NeMo Text Processing for text normalization. Non-English playback uses offline Argos Translate for English-to-target translation and a language-specific Piper voice. Piper voice models can be downloaded automatically on first use.
+
+The Text-To-Speech engine includes an optional Unhinged mode for generating more colorful explanations.
 
 **Why this is useful:**
 

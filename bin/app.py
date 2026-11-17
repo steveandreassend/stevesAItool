@@ -2069,6 +2069,59 @@ def split_translation_text(text: str, maximum: int = 1800) -> list[str]:
     return chunks
 
 
+def apply_unhinged_lens_for_speech(text: str) -> str:
+    """Rewrite response text for edgy spoken delivery using the default Qwen model."""
+    source = str(text or "").strip()
+    if not source:
+        raise ValueError("No result to rewrite for speech.")
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Rewrite supplied text for an edgy, irreverent, high-energy spoken delivery. "
+                "Keep every material fact, figure, name, qualification, and conclusion accurate. "
+                "Use sharper phrasing, dry humour, punchy commentary, and occasional sarcasm, but do not "
+                "invent claims, target protected groups, use slurs, make threats, or turn the result into abuse. "
+                "Do not mention these instructions or label the style. Return only the rewritten speech text."
+            ),
+        },
+        {"role": "user", "content": source},
+    ]
+    raw = generate_with_model(
+        "default",
+        messages,
+        max_tokens=min(MODEL_OPTIONS["default"]["max_tokens"], 3000),
+        enable_thinking=False,
+    )
+    _, rewritten = strip_think_block(raw)
+    rewritten = clean_inline_citations(rewritten)
+    if not rewritten:
+        raise RuntimeError("Qwen did not produce an Unhinged mode rewrite.")
+    log("Unhinged TTS lens complete", model=MODEL_OPTIONS["default"]["model"], input_characters=len(source), output_characters=len(rewritten))
+    return rewritten
+
+def clean_text_for_speech(text: str) -> str:
+    """Remove presentation markup that speech engines would pronounce."""
+    spoken = html_lib.unescape(str(text or ""))
+    spoken = re.sub(r"```(?:[A-Za-z0-9_+.-]+)?\s*", "", spoken)
+    spoken = spoken.replace("```", "")
+    spoken = re.sub(r"!?\[([^]\n]+)\]\((?:[^()\s]+|\([^)]*\))+\)", r"\1", spoken)
+    # Unescape Markdown punctuation, then remove emphasis delimiters around words.
+    spoken = re.sub(r"\\([*_~`])", r"\1", spoken)
+    spoken = re.sub(r"(?<!\w)(?:\*{1,3}|_{1,3}|~{2}|`{1,3})(?=\S)", "", spoken)
+    spoken = re.sub(r"(?<=\S)(?:\*{1,3}|_{1,3}|~{2}|`{1,3})(?!\w)", "", spoken)
+    spoken = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", spoken)
+    spoken = re.sub(r"(?m)^\s*>\s?", "", spoken)
+    spoken = re.sub(r"(?m)^\s*[-+*•]\s+", "", spoken)
+    spoken = re.sub(r"(?m)^\s*\d+[.)]\s+", "", spoken)
+    spoken = re.sub(r"(?m)^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$", "", spoken)
+    spoken = spoken.replace("|", ". ")
+    spoken = re.sub(r"<[^>]+>", " ", spoken)
+    spoken = re.sub(r"[ \t]+", " ", spoken)
+    spoken = re.sub(r"\s*\n\s*", "\n", spoken)
+    spoken = re.sub(r"\n{3,}", "\n\n", spoken)
+    return spoken.strip()
+
 def translate_for_speech(text: str, language_code: str) -> str:
     """Translate visible response text for TTS without using any LLM."""
     language_code = language_code if language_code in LANGUAGES else "en"
@@ -2857,8 +2910,9 @@ def upload():
 @app.post("/api/tts")
 def tts():
     data = request.get_json(force=True)
-    text = re.sub(r"\s+", " ", str(data.get("text") or "")).strip()
+    text = clean_text_for_speech(str(data.get("text") or ""))
     language_code = str(data.get("language") or "en").lower()
+    unhinged = bool(data.get("unhinged", False))
     if not text:
         return jsonify(error="No result to speak."), 400
     if language_code not in LANGUAGES:
@@ -2870,9 +2924,14 @@ def tts():
             engine=engine_name,
             language=LANGUAGES[language_code],
             input_characters=len(text),
+            unhinged=unhinged,
         )
         clean_audio()
-        spoken = translate_for_speech(text, language_code)
+        # Run the optional Qwen rewrite as its own stage before translation and
+        # before the pronunciation/text normalization performed for Piper.
+        speech_source = apply_unhinged_lens_for_speech(text) if unhinged else text
+        speech_source = clean_text_for_speech(speech_source)
+        spoken = translate_for_speech(speech_source, language_code)
         filename = f"speech-{uuid.uuid4().hex}.wav"
         output_path = AUDIO / filename
         synthesize_piper(spoken, language_code, output_path)
@@ -2883,6 +2942,7 @@ def tts():
             engine=engine_name,
             language=LANGUAGES[language_code],
             voice=PIPER_VOICE_NAMES.get(language_code),
+            unhinged=unhinged,
             bytes=output_path.stat().st_size,
         )
         return jsonify(
@@ -2890,6 +2950,7 @@ def tts():
             engine=engine_name,
             language=language_code,
             voice=PIPER_VOICE_NAMES.get(language_code),
+            unhinged=unhinged,
         )
     except Exception as exc:
         log("TTS failed", language=language_code, error=repr(exc))
@@ -2991,18 +3052,18 @@ HTML = r'''<!doctype html>
 *{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f5f7;color:#17171a}
 .shell{max-width:1050px;margin:28px auto;padding:0 18px}.card{position:relative;background:#fff;border:1px solid #e5e5e8;border-radius:14px;box-shadow:0 8px 28px #0001;padding:22px}.theme-toggle{position:absolute;top:16px;right:16px;padding:5px 9px;font-size:12px;line-height:1.2}
 h1{margin:0 0 4px;font-size:25px}.sub,.status,.files,.meta{color:var(--muted)}
-.bar,.audio{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}.model-choice{display:flex;gap:10px;align-items:center;margin-top:12px}.model-choice label{font-size:13px;font-weight:650;color:var(--muted)}.model-choice select{min-width:310px}
+.bar,.audio{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}.model-choice{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}.model-choice label{font-size:13px;font-weight:650;color:var(--muted)}.model-choice select{min-width:310px}.model-overview-button{padding:5px 8px;font-size:12px;color:var(--blue)}.model-overview-table{width:100%;border-collapse:collapse;font-size:13px}.model-overview-table th,.model-overview-table td{padding:8px 10px;border:1px solid var(--line);text-align:left;vertical-align:top}.model-overview-table th{background:#f3f6f9;white-space:nowrap}.unhinged-option{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);white-space:nowrap}.unhinged-option input{margin:0}
 .live-activity{display:none;margin:12px 0;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#f8fafc}.live-activity.active{display:block}.live-label{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}.live-transcript{margin-top:5px;white-space:pre-wrap;line-height:1.45}.live-stage{margin-top:8px;font-size:13px;color:var(--blue)}.live-dot{display:inline-block;width:7px;height:7px;margin-right:7px;border-radius:50%;background:var(--blue);animation:pulse 1.1s infinite}@keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
 .search-panel{margin:18px 0;padding:16px;border:1px solid var(--line);border-radius:12px;background:#f8fafc}.search-panel h2{font-size:17px;margin:0 0 4px}.search-suggestions{margin:9px 0 4px;padding:11px;border:1px solid var(--line);border-radius:10px;background:#fff}.search-suggestions-title{font-size:12px;font-weight:700;color:var(--muted);margin-bottom:7px}.search-suggestion-list{display:grid;gap:7px}.search-suggestion{width:100%;text-align:left;padding:8px 10px;color:var(--blue)}.search-batch-tools{display:flex;justify-content:flex-end;margin:2px 0 8px}.search-batch-tools button{font-size:13px;padding:7px 11px}.search-suggestion-group{margin-bottom:10px}.search-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px 14px;margin-top:12px}[hidden]{display:none!important}.search-field{display:flex;flex-direction:column;gap:5px}.search-field.full{grid-column:1/-1}.search-field label{font-size:12px;font-weight:700;color:var(--muted)}.checkbox-line{display:flex;flex-direction:row;align-items:center;gap:7px;font-weight:500!important}.checkbox-line input{width:auto!important;margin:0;flex:0 0 auto}.search-field input,.search-field textarea{width:100%;border:1px solid var(--line);border-radius:8px;padding:9px;font:inherit}.search-field textarea{min-height:70px}.search-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}.search-results{margin-top:13px;display:grid;gap:9px}.search-batch-heading{margin-top:8px;padding:8px 10px;border-radius:8px;background:#eef3f8;color:var(--muted);font-size:12px;font-weight:700}.search-result{padding:10px;border:1px solid var(--line);border-radius:9px}.search-result-head{display:flex;align-items:flex-start;gap:9px}.search-result-toggle{width:17px;height:17px;margin:2px 0 0;flex:0 0 auto}.search-result.excluded{opacity:.52;background:#f0f1f3}.search-result.excluded .search-highlight{text-decoration:none}.search-result a{font-weight:650;color:var(--blue)}.search-result-meta{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-top:3px;color:var(--muted);font-size:12px}.search-result-meta .separator{opacity:.65}.search-highlights{margin:8px 0 0 26px}.search-highlights summary{cursor:pointer;color:var(--muted);font-size:12px;font-weight:650;user-select:none}.search-highlight{margin-top:5px;color:var(--muted);font-size:13px;line-height:1.4}.category-select{min-height:122px}.language-picker{position:relative}.language-picker summary{list-style:none;cursor:pointer;border:1px solid var(--line);background:#fff;border-radius:8px;padding:9px 34px 9px 10px;position:relative;user-select:none}.language-picker summary::-webkit-details-marker{display:none}.language-picker summary:after{content:"▾";position:absolute;right:11px;color:var(--muted)}.language-picker[open] summary:after{content:"▴"}.language-popout{position:absolute;z-index:20;top:calc(100% + 5px);left:0;width:min(430px,90vw);max-height:320px;overflow:auto;padding:12px;border:1px solid var(--line);border-radius:10px;background:#fff;box-shadow:0 12px 30px #0002}.language-toolbar{display:flex;gap:8px;margin-bottom:9px}.language-toolbar button{padding:5px 8px;font-size:12px}.language-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 10px}.language-option{display:flex;align-items:center;gap:7px;font-size:13px}.language-option input{width:auto!important;margin:0}.date-fields{display:flex;gap:8px}.date-fields>*{min-width:0}.search-ready{color:#18794e;font-weight:650}textarea{width:100%;min-height:120px;border:1px solid var(--line);border-radius:10px;padding:13px;font:inherit;resize:vertical}
 button,.upload,select{border:1px solid var(--line);background:#fff;border-radius:9px;padding:9px 14px;font:inherit;cursor:pointer}
-.primary{background:var(--blue);border-color:var(--blue);color:#fff}.danger{color:#b42318}button:disabled{opacity:.55;cursor:not-allowed}
+.primary{background:var(--blue);border-color:var(--blue);color:#fff}.danger{color:#b42318}button:disabled{opacity:.55;cursor:not-allowed}.status.is-reasoning{color:#7c3aed;font-weight:700;animation:reasoning-flash .85s ease-in-out infinite}@keyframes reasoning-flash{0%,100%{opacity:1;text-shadow:0 0 0 transparent}50%{opacity:.32;text-shadow:0 0 8px #7c3aed66}}:root[data-theme="dark"] .status.is-reasoning{color:#c4b5fd}@media(prefers-reduced-motion:reduce){.status.is-reasoning{animation:none}}
 .turn{border-top:1px solid #ececf0;padding-top:15px;margin-top:15px}.response-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
 .response-tools{display:flex;gap:6px;align-items:center;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}.response-tools select,.response-tools button{padding:5px 8px;font-size:12px}.related-searches{margin:10px 0 4px;padding:10px;border:1px solid var(--line);border-radius:9px;background:#f8fafc}.related-searches-title{font-size:12px;font-weight:700;color:var(--muted);margin-bottom:7px}.related-search-list{display:grid;gap:7px}.related-search-query{width:100%;text-align:left;padding:8px 10px;color:var(--blue)}
 .prompt{font-weight:650;margin-bottom:8px}.answer{line-height:1.58}.answer h1,.answer h2,.answer h3,.answer h4,.youtube-section-body h1,.youtube-section-body h2,.youtube-section-body h3,.youtube-section-body h4{margin:1.05em 0 .42em;line-height:1.25}.answer h1,.youtube-section-body h1{font-size:1.35rem}.answer h2,.youtube-section-body h2{font-size:1.2rem}.answer h3,.youtube-section-body h3{font-size:1.08rem}.answer p,.youtube-section-body p{margin:.55em 0}.answer ul,.answer ol,.youtube-section-body ul,.youtube-section-body ol{margin:.55em 0 .75em;padding-left:1.45em}.answer li,.youtube-section-body li{margin:.28em 0}.answer strong,.youtube-section-body strong{font-weight:700}.answer code,.youtube-section-body code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;background:#0000000d;border-radius:4px;padding:.08em .3em}.answer pre,.youtube-section-body pre{overflow:auto;background:#111827;color:#f9fafb;border-radius:8px;padding:12px}.answer pre code,.youtube-section-body pre code{background:transparent;padding:0}.answer blockquote,.youtube-section-body blockquote{margin:.7em 0;padding:.15em 0 .15em 12px;border-left:3px solid var(--line);color:var(--muted)}.table-wrap{max-width:100%;overflow-x:auto;margin:.8em 0;border:1px solid var(--line);border-radius:9px}.answer table,.youtube-section-body table{width:100%;border-collapse:collapse;font-size:.93em;background:#fff}.answer th,.answer td,.youtube-section-body th,.youtube-section-body td{padding:8px 10px;border-bottom:1px solid var(--line);border-right:1px solid var(--line);text-align:left;vertical-align:top;white-space:nowrap}.answer th:last-child,.answer td:last-child,.youtube-section-body th:last-child,.youtube-section-body td:last-child{border-right:0}.answer tr:last-child td,.youtube-section-body tr:last-child td{border-bottom:0}.answer th,.youtube-section-body th{font-weight:700;background:#f3f6f9;position:sticky;top:0}.sources{font-size:13px;margin-top:10px}.sources a{color:var(--blue);word-break:break-word}
 .reasoning-block{margin:10px 0;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#00000005}.reasoning-block summary{cursor:pointer;font-size:13px;font-weight:650;color:var(--muted)}.reasoning-content{margin-top:8px;white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45}.meta{display:flex;gap:14px;align-items:center;margin-top:9px;font-size:12px}.copy-link{border:0;background:transparent!important;padding:0;color:var(--blue);font-size:12px}.copy-link:hover{text-decoration:underline}
 .youtube-sections{display:grid;gap:14px;margin-top:8px}.youtube-section{border:1px solid var(--line);border-radius:11px;padding:14px;background:#fbfcfe}.youtube-section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:9px}.youtube-section-title{font-size:17px;font-weight:700}.youtube-section-tools{display:flex;gap:6px;align-items:center;flex-shrink:0}.youtube-section-tools select,.youtube-section-tools button{padding:5px 8px;font-size:12px}.youtube-section-body{line-height:1.58}
 input[type=file]{display:none}audio{width:min(520px,100%)}
-.youtube-modal-backdrop{position:fixed;inset:0;z-index:100;background:#0009;display:flex;align-items:center;justify-content:center;padding:18px}.youtube-modal{width:min(760px,100%);max-height:88vh;overflow:auto;background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:0 20px 60px #0005;padding:20px}.youtube-modal h2{margin:0 0 5px}.youtube-modal-list{display:grid;gap:14px;margin:16px 0}.youtube-segment-card{border:1px solid var(--line);border-radius:11px;padding:13px}.youtube-video-title{font-weight:700;margin-bottom:4px}.youtube-video-url-row{display:flex;gap:8px;align-items:center}.youtube-video-url{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px}.youtube-copy-url{padding:4px 7px;font-size:11px;flex:0 0 auto}.youtube-time-row{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;margin-top:12px}.youtube-time-value{font-variant-numeric:tabular-nums;font-weight:700;text-align:center}.youtube-range{width:100%;padding:0;border:0}.youtube-modal-actions{display:flex;justify-content:flex-end;gap:9px}.youtube-modal-error{color:#b42318;font-size:13px;margin-top:8px}:root[data-theme="dark"] .youtube-modal{background:#1c1d21}
+.youtube-modal-backdrop{position:fixed;inset:0;z-index:100;background:#0009;display:flex;align-items:center;justify-content:center;padding:18px}.youtube-modal{width:min(760px,100%);max-height:88vh;overflow:auto;background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:0 20px 60px #0005;padding:20px}.youtube-modal h2{margin:0 0 5px}.youtube-modal-list{display:grid;gap:14px;margin:16px 0}.youtube-segment-card{border:1px solid var(--line);border-radius:11px;padding:13px}.youtube-video-title{font-weight:700;margin-bottom:4px}.youtube-video-url-row{display:flex;gap:8px;align-items:center}.youtube-video-url{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px}.youtube-copy-url{padding:4px 7px;font-size:11px;flex:0 0 auto}.youtube-time-row{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;margin-top:12px}.youtube-time-value{font-variant-numeric:tabular-nums;font-weight:700;text-align:center}.youtube-range{width:100%;padding:0;border:0}.youtube-modal-actions{display:flex;justify-content:flex-end;gap:9px}.youtube-modal-error{color:#b42318;font-size:13px;margin-top:8px}:root[data-theme="dark"] .youtube-modal{background:#1c1d21}:root[data-theme="dark"] .model-overview-table th{background:#292c32}
 @media(max-width:700px){.search-grid{grid-template-columns:1fr}.search-field.full{grid-column:auto}.response-head{display:block}.response-tools{margin:5px 0 10px}.bar{align-items:flex-start}}
 :root[data-theme="dark"] body{background:#111215;color:#f3f3f5}:root[data-theme="dark"] .card{background:#1c1d21;border-color:#34353b}:root[data-theme="dark"] textarea,:root[data-theme="dark"] button,:root[data-theme="dark"] .upload,:root[data-theme="dark"] select{background:#25262b;color:#f3f3f5;border-color:#45464d}:root[data-theme="dark"] .turn{border-color:#34353b}:root[data-theme="dark"] .live-activity,:root[data-theme="dark"] .search-panel{background:#23252a}:root[data-theme="dark"] .search-suggestions,:root[data-theme="dark"] .related-searches{background:#202227}:root[data-theme="dark"] .search-result.excluded{background:#191a1e}:root[data-theme="dark"] .search-batch-heading{background:#292c32}:root[data-theme="dark"] .youtube-section{background:#202227}:root[data-theme="dark"] .answer table,:root[data-theme="dark"] .youtube-section-body table{background:#202227}:root[data-theme="dark"] .answer th,:root[data-theme="dark"] .youtube-section-body th{background:#292c32}:root[data-theme="dark"] .language-picker summary,:root[data-theme="dark"] .language-popout{background:#25262b;color:#f3f3f5;border-color:#45464d}
 .system-health{position:sticky;top:0;z-index:30;display:flex;align-items:center;justify-content:center;gap:5px;min-height:24px;margin:-12px 54px 8px;padding:4px 8px;background:#fff;border-bottom:1px solid transparent;color:var(--muted);font-size:10.5px;line-height:1.25;letter-spacing:.01em;white-space:nowrap}.system-health .health-label{font-weight:600;color:inherit}.system-health .health-value{font-variant-numeric:tabular-nums}.system-health .health-separator{opacity:.55}.system-health[data-level="high"]{color:#a15c00}.system-health[data-level="critical"]{color:#b42318}:root[data-theme="dark"] .system-health[data-level="high"]{color:#f0b35b}:root[data-theme="dark"] .system-health{background:#1c1d21}:root[data-theme="dark"] .system-health[data-level="critical"]{color:#ff8178}@media(max-width:680px){.system-health{margin:-8px 46px 9px;white-space:normal;text-align:center;flex-wrap:wrap}}
@@ -3034,7 +3095,7 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
 <div class="search-results" id="searchResults"></div>
 </section>
 <textarea id="prompt" placeholder="Paste an article URL for an English summary, or ask the model to analyse search results, attached files, or another topic..."></textarea>
-<div class="model-choice"><label for="modelSelect">Model for this prompt</label><select id="modelSelect"><option value="default" selected>Default — Qwen3 14B</option><option value="reasoning">DeepSeek Logical Reasoning</option><option value="summary">Summarization — Qwen3.5 9B</option><option value="quick">Quick Summarization — Qwen3.5 4B</option><option value="gemma">Multimodal analysis &amp; reasoning — Gemma 4 12B</option><option value="qwen3_vl">Screenshots, OCR, charts &amp; documents — Qwen3-VL 8B</option></select></div>
+<div class="model-choice"><label for="modelSelect">Model for this prompt</label><select id="modelSelect"><option value="default" selected>Default — Qwen3 14B</option><option value="reasoning">DeepSeek Logical Reasoning</option><option value="summary">Summarization — Qwen3.5 9B</option><option value="quick">Quick Summarization — Qwen3.5 4B</option><option value="gemma">Multimodal analysis &amp; reasoning — Gemma 4 12B</option><option value="qwen3_vl">Screenshots, OCR, charts &amp; documents — Qwen3-VL 8B</option></select><button type="button" id="modelOverviewButton" class="model-overview-button">Model Overview</button></div>
 <div class="bar">
 <button class="primary" id="send">Run prompt</button>
 <button id="live" title="Speak a prompt through the Mac microphone">🎙 Start live mode</button>
@@ -3053,7 +3114,25 @@ input[type=file]{display:none}audio{width:min(520px,100%)}
 <div class="files" id="mediaStatus">No audio or video attached.</div>
 <div class="audio"><label>Playback speed <select id="speed"><option value="0.75">0.75x</option><option value="1" selected>1.0x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2.0x</option></select></label><audio id="player" controls></audio></div>
 <div id="history"></div>
-<div id="youtubeModalBackdrop" class="youtube-modal-backdrop" hidden>
+<div id="modelOverviewBackdrop" class="youtube-modal-backdrop" hidden>
+    <section class="youtube-modal" role="dialog" aria-modal="true" aria-labelledby="modelOverviewTitle">
+      <h2 id="modelOverviewTitle">Model Overview</h2>
+      <div class="sub">Model sizes and context windows are architecture specifications. Active parameters are shown where the model uses a mixture-of-experts architecture.</div>
+      <div class="table-wrap"><table class="model-overview-table">
+        <thead><tr><th>Model</th><th>Parameters</th><th>Active parameters</th><th>Context window</th><th>Key use cases</th></tr></thead>
+        <tbody>
+          <tr><td>Qwen3 14B</td><td>14.8B</td><td>14.8B (dense)</td><td>32K</td><td>Default chat, drafting, analysis, research synthesis, and the Unhinged TTS rewrite.</td></tr>
+          <tr><td>DeepSeek-R1-Distill-Qwen 14B</td><td>14.8B</td><td>14.8B (dense)</td><td>128K</td><td>Multi-step logical reasoning, difficult comparisons, and problems where an explicit reasoning pass helps.</td></tr>
+          <tr><td>Qwen3.5 9B</td><td>9B</td><td>9B (dense)</td><td>262K</td><td>Long-document summarisation, synthesis across large evidence sets, and efficient general analysis.</td></tr>
+          <tr><td>Qwen3.5 4B</td><td>4B</td><td>4B (dense)</td><td>262K</td><td>Fast summarisation, extraction, lightweight drafting, and lower-memory work.</td></tr>
+          <tr><td>Gemma 4 12B</td><td>12B</td><td>12B (dense)</td><td>256K</td><td>Multimodal document and image analysis, visual reasoning, and general-purpose analysis.</td></tr>
+          <tr><td>Qwen3-VL 8B</td><td>8B</td><td>8B (dense)</td><td>256K</td><td>Screenshots, OCR, charts, scanned documents, and detailed image interpretation.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="youtube-modal-actions"><button type="button" id="modelOverviewClose" class="primary">Close</button></div>
+    </section>
+  </div>
+  <div id="youtubeModalBackdrop" class="youtube-modal-backdrop" hidden>
   <section class="youtube-modal" role="dialog" aria-modal="true" aria-labelledby="youtubeModalTitle">
     <h2 id="youtubeModalTitle">Select YouTube transcription segments</h2>
     <div class="sub">Choose the start and finish for each video. The full duration is selected by default.</div>
@@ -3110,7 +3189,11 @@ function applyTheme(theme){
 }
 applyTheme(localStorage.getItem('theme')||'light');
 $('themeToggle').onclick=()=>applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
-const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+$('modelOverviewButton').onclick=()=>{$('modelOverviewBackdrop').hidden=false};
+  $('modelOverviewClose').onclick=()=>{$('modelOverviewBackdrop').hidden=true};
+  $('modelOverviewBackdrop').addEventListener('click',event=>{if(event.target===$('modelOverviewBackdrop'))$('modelOverviewBackdrop').hidden=true});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape')$('modelOverviewBackdrop').hidden=true});
+  const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function inlineMarkdown(text){
   let value=esc(text);
   value=value.replace(/`([^`]+)`/g,'<code>$1</code>');
@@ -3183,7 +3266,7 @@ function renderMarkdown(markdown){
   if(code)flushCode();flushParagraph();closeList();return html;
 }
 const langOptions='<option value="en">English</option><option value="fr">French</option><option value="es">Spanish</option><option value="de">German</option><option value="it">Italian</option><option value="nl">Dutch</option><option value="pt">Portuguese</option>';
-function busy(on,text){$('send').disabled=on;$('runSearch').disabled=on;document.querySelectorAll('.suggest-searches-button,.related-searches-button').forEach(button=>button.disabled=on);$('status').textContent=text||'Ready'}
+function busy(on,text){$('send').disabled=on;$('runSearch').disabled=on;document.querySelectorAll('.suggest-searches-button,.related-searches-button').forEach(button=>button.disabled=on);const status=$('status'),message=text||'Ready';status.textContent=message;status.classList.toggle('is-reasoning',Boolean(on&&message==='Reasoning over the approved evidence...'))}
 function renderActiveAttachments(attachments){const items=attachments||[];$('fileList').textContent=items.length?'Attached: '+items.map(item=>item.kind==='image'?`${item.name} (image ${item.width}x${item.height})`:`${item.name} (${Number(item.characters||0).toLocaleString()} chars)`).join(', '):'No documents or images attached.'}
 function showLiveActivity(transcript,message,working=true){$('liveActivity').classList.add('active');if(transcript!==null&&transcript!==undefined)$('liveTranscript').textContent=transcript;$('liveStageText').textContent=message||'';const dot=$('liveActivity').querySelector('.live-dot');dot.style.display=working?'inline-block':'none';$('status').textContent=message||$('status').textContent}
 function resetLiveActivity(){ $('liveActivity').classList.remove('active');$('liveTranscript').textContent='Waiting for speech...';$('liveStageText').textContent='Listening...' }
@@ -3264,13 +3347,13 @@ function parseYoutubeSections(answer){
   for(const key of Object.keys(sections))sections[key]=sections[key].join('\n').trim();
   return sections['Executive Summary']&&sections['Key Points']&&sections['Conclusion']?sections:null;
 }
-function youtubeSection(title,body){return `<section class="youtube-section"><div class="youtube-section-head"><div class="youtube-section-title">${esc(title)}</div><div class="youtube-section-tools"><select class="read-lang" aria-label="Read ${esc(title)} aloud language">${langOptions}</select><button onclick="readSection(this)">🔊 Read aloud</button></div></div><div class="youtube-section-body">${renderMarkdown(body)}</div></section>`}
+function youtubeSection(title,body){return `<section class="youtube-section"><div class="youtube-section-head"><div class="youtube-section-title">${esc(title)}</div><div class="youtube-section-tools"><select class="read-lang" aria-label="Read ${esc(title)} aloud language">${langOptions}</select><label class="unhinged-option" title="Use Qwen3 14B to rewrite this section with a sharper, edgier spoken lens before pronunciation processing and TTS"><input type="checkbox" class="unhinged-mode"> Unhinged</label><button onclick="readSection(this)">🔊 Read aloud</button></div></div><div class="youtube-section-body">${renderMarkdown(body)}</div></section>`}
 function addTurn(prompt,answer,sources,elapsed,responseType='standard',reasoning='',modelLabel=''){
   latest=answer;
   const src=(sources||[]).map((s,i)=>s.url?`<div><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title||('Source '+(i+1)))}</a></div>`:`<div>${esc(s.title||('Source '+(i+1)))}</div>`).join('');
   const sections=responseType==='youtube_summary'?parseYoutubeSections(answer):null;
   const relatedButton='<button type="button" class="related-searches-button" onclick="suggestRelatedSearches(this)" title="Use the complete chat to propose three Exa searches">Suggest Related Searches</button>';
-  const responseHtml=sections?`<div class="response-head"><div></div><div class="response-tools">${relatedButton}</div></div><div class="youtube-sections">${youtubeSection('Executive Summary',sections['Executive Summary'])}${youtubeSection('Key Points',sections['Key Points'])}${youtubeSection('Conclusion',sections['Conclusion'])}</div>`:`<div class="response-head"><div class="prompt">${esc(prompt)}</div><div class="response-tools"><select class="read-lang" aria-label="Read aloud language">${langOptions}</select><button onclick="readTurn(this)">🔊 Read aloud</button>${relatedButton}</div></div><div class="answer">${renderMarkdown(answer)}</div>`;
+  const responseHtml=sections?`<div class="response-head"><div></div><div class="response-tools">${relatedButton}</div></div><div class="youtube-sections">${youtubeSection('Executive Summary',sections['Executive Summary'])}${youtubeSection('Key Points',sections['Key Points'])}${youtubeSection('Conclusion',sections['Conclusion'])}</div>`:`<div class="response-head"><div class="prompt">${esc(prompt)}</div><div class="response-tools"><select class="read-lang" aria-label="Read aloud language">${langOptions}</select><label class="unhinged-option" title="Use Qwen3 14B to rewrite this response with a sharper, edgier spoken lens before pronunciation processing and TTS"><input type="checkbox" class="unhinged-mode"> Unhinged</label><button onclick="readTurn(this)">🔊 Read aloud</button>${relatedButton}</div></div><div class="answer">${renderMarkdown(answer)}</div>`;
   const promptHtml=sections?`<div class="prompt">${esc(prompt)}</div>`:'';
   const reasoningHtml=reasoning?`<details class="reasoning-block"><summary>Show reasoning — ${esc(modelLabel||'selected model')}</summary><div class="reasoning-content">${esc(reasoning)}</div></details>`:'';
   $('history').insertAdjacentHTML('afterbegin',`<article class="turn" data-response-type="${esc(responseType)}">${promptHtml}${reasoningHtml}${responseHtml}<div class="answer" hidden>${esc(answer)}</div><div class="sources">${src}</div><div class="meta"><span>Completed in ${Number(elapsed).toFixed(2)}s</span><button class="copy-link" onclick="copyResponse(this)">Copy response</button></div></article>`)
@@ -3329,11 +3412,11 @@ async function playCachedAudio(button){
     button.textContent='⏸ Playing';$('player').onended=()=>button.textContent='▶ Play audio';$('status').textContent='Playing generated audio.';return true;
   }catch(error){console.error('Audio playback failed',error);button.textContent='▶ Play audio';$('status').textContent='Playback failed: '+error.message;return false}
 }
-async function generateAudio(button,text,language){
+async function generateAudio(button,text,language,unhinged=false){
   button.disabled=true;button.textContent='Generating...';
   try{
     if($('live').textContent.includes('Stop')&&!$('micMute').textContent.includes('Unmute'))await setMicMuted(true);
-    const response=await fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,language})});
+    const response=await fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,language,unhinged})});
     const data=await response.json();if(!response.ok)throw Error(data.error||'Speech generation failed.');
     button.dataset.audioUrl=data.audio_url;button.dataset.loaded='false';
     await loadAudioIntoPlayer(data.audio_url);button.dataset.loaded='true';
@@ -3345,14 +3428,14 @@ async function generateAudio(button,text,language){
 async function readSection(button){
   if(button.dataset.audioUrl){await playCachedAudio(button);return}
   const section=button.closest('.youtube-section');
-  await generateAudio(button,section.querySelector('.youtube-section-body').textContent,section.querySelector('.read-lang').value);
+  await generateAudio(button,section.querySelector('.youtube-section-body').textContent,section.querySelector('.read-lang').value,Boolean(section.querySelector('.unhinged-mode')?.checked));
 }
 async function readTurn(button){
   if(button.dataset.audioUrl){await playCachedAudio(button);return}
   const turn=button.closest('.turn');
-  await generateAudio(button,turn.querySelector('.answer').textContent,turn.querySelector('.read-lang').value);
+  await generateAudio(button,turn.querySelector('.answer').textContent,turn.querySelector('.read-lang').value,Boolean(turn.querySelector('.unhinged-mode')?.checked));
 }
-document.addEventListener('change',event=>{if(!event.target.classList.contains('read-lang'))return;const tools=event.target.closest('.youtube-section-tools,.response-tools');const button=tools&&tools.querySelector('button');if(button){delete button.dataset.audioUrl;delete button.dataset.loaded;button.textContent='🔊 Read aloud'}});
+document.addEventListener('change',event=>{if(!event.target.classList.contains('read-lang')&&!event.target.classList.contains('unhinged-mode'))return;const tools=event.target.closest('.youtube-section-tools,.response-tools');const button=tools&&tools.querySelector('button');if(button){delete button.dataset.audioUrl;delete button.dataset.loaded;button.textContent='🔊 Read aloud'}});
 function updateFreshnessFields(){const mode=$('freshnessMode').value;const maxAge=$('maxAgeField'),dateRange=$('dateRangeField');maxAge.hidden=mode!=='max_age';dateRange.hidden=mode!=='date_range';maxAge.style.display=mode==='max_age'?'flex':'none';dateRange.style.display=mode==='date_range'?'flex':'none'}
 $('freshnessMode').onchange=updateFreshnessFields;updateFreshnessFields();
 function selectedSearchResultIndices(){return Array.from(document.querySelectorAll('.search-result-toggle:checked')).map(box=>Number(box.dataset.index))}
