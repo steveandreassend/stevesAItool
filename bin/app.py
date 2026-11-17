@@ -2748,10 +2748,18 @@ def chat():
         youtube_segments = data.get("youtube_segments") or []
         media_segment = data.get("media_segment")
         uploaded_media = current_session.get("media")
+        media_consumed = False
         if media_segment and uploaded_media:
             response_type = "media_analysis"
             output, reasoning, sources = analyze_local_media(prompt, uploaded_media, media_segment, model_key)
             record_chat_turn(current_session, prompt, output)
+            # Uploaded media is a one-shot attachment. Remove it only after the
+            # transcription and model response complete successfully, so a
+            # follow-on prompt cannot offer to transcribe the same file again.
+            current_session["media"] = None
+            shutil.rmtree(MEDIA / secure_filename(session_id), ignore_errors=True)
+            media_consumed = True
+            log("Local media attachment consumed after successful analysis", name=uploaded_media.get("name"))
         elif article_urls:
             response_type = "article_summary"
             output, reasoning, sources = summarize_article_batch(prompt, article_urls, model_key)
@@ -2790,6 +2798,7 @@ def chat():
             model_key=model_key,
             model_label=MODEL_OPTIONS[model_key]["label"],
             attachments=active_attachment_metadata(current_session),
+            media_consumed=media_consumed,
         )
     except Exception as exc:
         log("Chat processing failed", error=repr(exc))
@@ -3464,7 +3473,7 @@ $('mediaFile').onchange=async()=>{
   const fd=new FormData();fd.append('session_id',sid);fd.append('file',file);busy(true,'Uploading and inspecting media...');
   try{const r=await fetch('/api/media_upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;uploadedMedia=d.media;$('mediaStatus').textContent=`Attached media: ${d.media.name} · ${formatYoutubeTime(d.media.duration_seconds)} · ${(Number(d.media.bytes)/(1024*1024)).toFixed(1)} MB`;busy(false,'Media ready. Enter a prompt and run it.')}catch(e){uploadedMedia=null;$('mediaStatus').textContent='Media error: '+e.message;busy(false,'Error: '+e.message)}finally{$('mediaFile').value=''}
 };
-$('send').onclick=async()=>{const p=$('prompt').value.trim();if(!p)return;const started=performance.now();const youtubeUrls=extractYoutubeUrlsFromPrompt(p);let youtubeSegments=[],mediaSegment=null;try{if(uploadedMedia&&!youtubeUrls.length){busy(true,'Choose the audio or video segment to transcribe...');mediaSegment=await chooseLocalMediaSegment();if(mediaSegment===null){busy(false,'Media transcription cancelled.');return}}else if(youtubeUrls.length){busy(true,'Loading YouTube video details...');youtubeSegments=await chooseYoutubeSegments(p);if(youtubeSegments===null){busy(false,'YouTube transcription cancelled.');return}}const mediaWork=Boolean(mediaSegment);busy(true,mediaWork?'Transcribing the selected audio or video segment...':youtubeUrls.length?`Transcribing ${youtubeUrls.length} selected video segment${youtubeUrls.length===1?'':'s'}...`:'Reasoning over the approved evidence...');const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,prompt:p,youtube_segments:youtubeSegments,media_segment:mediaSegment,use_search_results:true,selected_source_indices:selectedSearchResultIndices(),selected_source_urls:selectedSearchResultUrls(),max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})});const d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;const elapsed=Number(d.elapsed_seconds||((performance.now()-started)/1000));addTurn(p,d.answer,d.sources,elapsed,d.response_type||'standard',d.reasoning||'',d.model_label||'');renderActiveAttachments(d.attachments);$('prompt').value='';busy(false,`Complete in ${elapsed.toFixed(2)}s`);beep()}catch(e){$('youtubeModalBackdrop').hidden=true;$('mediaModalBackdrop').hidden=true;busy(false,'Error: '+e.message)}};
+$('send').onclick=async()=>{const p=$('prompt').value.trim();if(!p)return;const started=performance.now();const youtubeUrls=extractYoutubeUrlsFromPrompt(p);let youtubeSegments=[],mediaSegment=null;try{if(uploadedMedia&&!youtubeUrls.length){busy(true,'Choose the audio or video segment to transcribe...');mediaSegment=await chooseLocalMediaSegment();if(mediaSegment===null){busy(false,'Media transcription cancelled.');return}}else if(youtubeUrls.length){busy(true,'Loading YouTube video details...');youtubeSegments=await chooseYoutubeSegments(p);if(youtubeSegments===null){busy(false,'YouTube transcription cancelled.');return}}const mediaWork=Boolean(mediaSegment);busy(true,mediaWork?'Transcribing the selected audio or video segment...':youtubeUrls.length?`Transcribing ${youtubeUrls.length} selected video segment${youtubeUrls.length===1?'':'s'}...`:'Reasoning over the approved evidence...');const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,prompt:p,youtube_segments:youtubeSegments,media_segment:mediaSegment,use_search_results:true,selected_source_indices:selectedSearchResultIndices(),selected_source_urls:selectedSearchResultUrls(),max_web_results:Number($('maxArticles').value),model_key:$('modelSelect').value})});const d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;const elapsed=Number(d.elapsed_seconds||((performance.now()-started)/1000));addTurn(p,d.answer,d.sources,elapsed,d.response_type||'standard',d.reasoning||'',d.model_label||'');renderActiveAttachments(d.attachments);if(d.media_consumed){uploadedMedia=null;$('mediaStatus').textContent='No audio or video attached.'}$('prompt').value='';busy(false,`Complete in ${elapsed.toFixed(2)}s`);beep()}catch(e){$('youtubeModalBackdrop').hidden=true;$('mediaModalBackdrop').hidden=true;busy(false,'Error: '+e.message)}};
 $('prompt').onkeydown=e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')$('send').click()};
 $('files').onchange=async()=>{const selectedFiles=Array.from($('files').files);if(selectedFiles.length>15){$('status').textContent='Select no more than 15 documents at once.';$('files').value='';return}const fd=new FormData();fd.append('session_id',sid);for(const file of selectedFiles)fd.append('files',file);busy(true,'Reading files...');try{const r=await fetch('/api/upload',{method:'POST',body:fd}),d=await r.json();if(!r.ok)throw Error(d.error);sid=d.session_id;renderActiveAttachments(d.attachments);if(d.errors.length)$('fileList').textContent+=' Errors: '+d.errors.map(x=>x.name+': '+x.error).join('; ');busy(false,'Files ready')}catch(e){busy(false,'Error: '+e.message)}finally{$('files').value=''}};
 $('speed').onchange=()=>$('player').playbackRate=Number($('speed').value);
