@@ -1542,9 +1542,23 @@ def validate_public_article_url(url: str) -> str:
     return parsed.geturl()
 
 
+def normalize_github_markdown_url(url: str) -> str:
+    """Convert a public GitHub Markdown blob URL to its raw-content URL."""
+    parsed = urlparse(str(url or "").strip())
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if host not in {"github.com", "www.github.com"}:
+        return parsed.geturl()
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 5 or parts[2] != "blob" or not parts[-1].lower().endswith(".md"):
+        return parsed.geturl()
+    owner, repository, _, revision, *document_path = parts
+    raw_path = "/".join([owner, repository, revision, *document_path])
+    return f"https://raw.githubusercontent.com/{raw_path}"
+
+
 def fetch_article_html(url: str) -> tuple[str, str, str]:
-    """Fetch a public webpage directly, following only validated public redirects."""
-    current = validate_public_article_url(url)
+    """Fetch a public HTML, Markdown, or plain-text document directly."""
+    current = validate_public_article_url(normalize_github_markdown_url(url))
     opener = __import__("urllib.request", fromlist=["build_opener"]).build_opener(
         __import__("urllib.request", fromlist=["HTTPHandler"]).HTTPHandler(),
         __import__("urllib.request", fromlist=["HTTPSHandler"]).HTTPSHandler(),
@@ -1561,8 +1575,15 @@ def fetch_article_html(url: str) -> tuple[str, str, str]:
             with opener.open(req, timeout=ARTICLE_FETCH_TIMEOUT) as response:
                 final_url = validate_public_article_url(response.geturl())
                 content_type = str(response.headers.get("Content-Type") or "").lower()
-                if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-                    raise ValueError(f"The URL returned {content_type or 'a non-HTML document'}, not a webpage.")
+                supported_content_types = (
+                    "text/html", "application/xhtml+xml", "text/plain", "text/markdown",
+                    "text/x-markdown", "application/markdown", "application/x-markdown",
+                )
+                if not any(item in content_type for item in supported_content_types):
+                    raise ValueError(
+                        f"The URL returned {content_type or 'an unsupported document type'}. "
+                        "Direct reading supports HTML webpages, Markdown files, and plain-text documents."
+                    )
                 limit = 8 * 1024 * 1024
                 raw = response.read(limit + 1)
                 if len(raw) > limit:
@@ -1691,9 +1712,28 @@ def summarize_article_batch(prompt: str, urls: list[str], model_key: str = DEFAU
     sources: list[dict[str, str]] = []
     for index, requested_url in enumerate(urls[:MAX_ARTICLE_URLS], 1):
         log("Direct article retrieval started", url=requested_url)
-        html, final_url, _ = fetch_article_html(requested_url)
-        metadata = article_metadata_from_html(html, final_url)
-        text, method = extract_article_text(html, final_url)
+        document, final_url, content_type = fetch_article_html(requested_url)
+        is_html = "text/html" in content_type or "application/xhtml+xml" in content_type
+        if is_html:
+            metadata = article_metadata_from_html(document, final_url)
+            text, method = extract_article_text(document, final_url)
+        else:
+            parsed_url = urlparse(final_url)
+            filename = Path(parsed_url.path).name
+            domain = (parsed_url.hostname or "").removeprefix("www.")
+            metadata = {
+                "title": filename or domain or "Text document",
+                "author": "",
+                "published_date": "",
+                "domain": domain,
+            }
+            text = document.replace("\x00", "")
+            text = re.sub(r"[ \t]+", " ", text)
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            if len(text.split()) < 10:
+                raise RuntimeError("The Markdown or text document did not contain enough readable text.")
+            text = text[:MAX_ARTICLE_CHARS]
+            method = "Direct Markdown/text retrieval"
         blocks.append(
             f"ARTICLE {index}\nTitle: {metadata['title']}\nURL: {final_url}\n"
             f"Website: {metadata['domain']}\nAuthor: {metadata['author'] or 'Unknown'}\n"
